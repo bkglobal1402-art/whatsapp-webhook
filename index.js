@@ -1,9 +1,5 @@
-process.on("uncaughtException", (err) => {
-  console.error("🔥 uncaughtException:", err);
-});
-process.on("unhandledRejection", (err) => {
-  console.error("🔥 unhandledRejection:", err);
-});
+process.on("uncaughtException", (err) => console.error("🔥 uncaughtException:", err));
+process.on("unhandledRejection", (err) => console.error("🔥 unhandledRejection:", err));
 
 const express = require("express");
 const fetch = require("node-fetch");
@@ -14,12 +10,9 @@ const Fuse = require("fuse.js");
 const app = express();
 app.use(express.json());
 
-let catalogCache = {
-  rows: [],
-  updatedAt: 0,
-  fuse: null,
-};
-
+/* =========================
+   Helpers
+========================= */
 function normalizeText(s = "") {
   return String(s)
     .toLowerCase()
@@ -29,26 +22,46 @@ function normalizeText(s = "") {
     .trim();
 }
 
+function safeNumberString(v) {
+  // Deja tal cual venga (porque tu Excel trae "20.000,00" etc.)
+  return String(v ?? "").trim();
+}
+
+/* =========================
+   Catalog cache + loader
+========================= */
+let catalogCache = {
+  rows: [],
+  updatedAt: 0,
+  fuse: null,
+  sheetName: null,
+};
+
+const FIVE_MIN = 5 * 60 * 1000;
+
 async function loadCatalogFromXlsx() {
   const url = process.env.CATALOG_XLSX_URL;
-  if (!url) {
-    console.log("❌ Missing CATALOG_XLSX_URL");
-    return;
+  if (!url) throw new Error("Missing CATALOG_XLSX_URL");
+
+  const now = Date.now();
+  if (catalogCache.rows.length > 0 && now - catalogCache.updatedAt < FIVE_MIN) {
+    return catalogCache; // cache fresh
   }
 
-  // refrescar cada 5 min
-  const now = Date.now();
-  const FIVE_MIN = 5 * 60 * 1000;
-  if (catalogCache.rows.length > 0 && now - catalogCache.updatedAt < FIVE_MIN) return;
-
   console.log("📦 Downloading XLSX catalog...");
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to download XLSX: ${resp.status}`);
+  const resp = await fetch(url, {
+    method: "GET",
+    // Tip: algunos links necesitan un user-agent para no bot-block
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Failed to download XLSX: ${resp.status}`);
+  }
 
   const buf = await resp.buffer();
   const wb = XLSX.read(buf, { type: "buffer" });
 
-  // Usa la primera hoja (o cámbiala por nombre si quieres)
   const sheetName = wb.SheetNames[0];
   const ws = wb.Sheets[sheetName];
 
@@ -56,19 +69,19 @@ async function loadCatalogFromXlsx() {
 
   // Espera columnas: Codigo, Producto, Precio_1, SaldoGeneral, Nombre_Grupo
   const normalizedRows = rows
-    .filter(r => r.Codigo || r.Producto)
-    .map(r => ({
+    .filter((r) => r.Codigo || r.Producto)
+    .map((r) => ({
       Codigo: String(r.Codigo || "").trim(),
       Producto: String(r.Producto || "").trim(),
-      Precio_1: String(r.Precio_1 || "").trim(),
-      SaldoGeneral: String(r.SaldoGeneral || "").trim(),
+      Precio_1: safeNumberString(r.Precio_1),
+      SaldoGeneral: safeNumberString(r.SaldoGeneral),
       Nombre_Grupo: String(r.Nombre_Grupo || "").trim(),
       _q: normalizeText(`${r.Codigo} ${r.Producto} ${r.Nombre_Grupo}`),
     }));
 
   const fuse = new Fuse(normalizedRows, {
     includeScore: true,
-    threshold: 0.35, // más bajo = más estricto
+    threshold: 0.35,
     keys: ["Codigo", "Producto", "_q", "Nombre_Grupo"],
   });
 
@@ -76,21 +89,24 @@ async function loadCatalogFromXlsx() {
     rows: normalizedRows,
     updatedAt: Date.now(),
     fuse,
+    sheetName,
   };
 
   console.log(`✅ Catalog loaded: ${normalizedRows.length} items (sheet: ${sheetName})`);
+  return catalogCache;
 }
 
-function searchCatalog(query, limit = 5) {
+function searchCatalog(query, limit = 6) {
   if (!catalogCache.fuse) return [];
-  const q = normalizeText(query);
+  const raw = String(query || "").trim();
+  const q = normalizeText(raw);
 
-  // si el usuario escribe un código exacto, primero intentamos match exacto
-  const exact = catalogCache.rows.find(r => r.Codigo && r.Codigo === query.trim());
+  // match exacto por código
+  const exact = catalogCache.rows.find((r) => r.Codigo && r.Codigo === raw);
   if (exact) return [exact];
 
   const results = catalogCache.fuse.search(q).slice(0, limit);
-  return results.map(r => r.item);
+  return results.map((r) => r.item);
 }
 
 function formatItemsForPrompt(items) {
@@ -103,63 +119,39 @@ function formatItemsForPrompt(items) {
     .join("\n");
 }
 
+/* =========================
+   OpenAI
+========================= */
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+async function askOpenAI(userText, catalogContextText, catalogOk) {
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// ✅ Home test
-app.get("/", (req, res) => res.status(200).send("OK"));
+  const systemRules =
+    `Eres un asesor comercial de BK GLOBAL (Colombia). ` +
+    `Respondes en español, natural, amable y directo. ` +
+    `Objetivo: ayudar al cliente y vender.\n\n` +
+    `Reglas:\n` +
+    `- Si te saludan: te presentas corto.\n` +
+    `- Si preguntan por precio/stock: responde usando el catálogo (Precio_1 y SaldoGeneral) si está disponible.\n` +
+    `- Si hay varias coincidencias: ofrece 2-3 opciones y pide una aclaración (marca/modelo/código).\n` +
+    `- Si NO encuentras el producto: pide marca/modelo/código y sugiere alternativas por grupo si aplica.\n` +
+    `- No inventes precios ni stock.\n` +
+    `- Respuestas cortas: 2 a 6 líneas máximo.\n`;
 
-// ✅ Meta webhook verification (GET)
-app.get("/webhook", (req, res) => {
-  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
-
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
-
-async function askOpenAI(userText) {
-  // 1) asegúrate de tener catálogo
-  await loadCatalogFromXlsx();
-
-  // 2) busca productos relacionados con lo que preguntó el cliente
-  const matches = searchCatalog(userText, 6);
-  const catalogContext = formatItemsForPrompt(matches);
+  const catalogSystem =
+    catalogOk
+      ? `CATÁLOGO (coincidencias para esta conversación):\n${catalogContextText}`
+      : `CATÁLOGO: No disponible en este momento (responde sin inventar precios/stock; ofrece verificar si el cliente da código o más detalles).`;
 
   const r = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    model,
+    temperature: 0.4,
     messages: [
-      {
-        role: "system",
-        content:
-          `Eres un asesor comercial de BK GLOBAL (Colombia).
-Respondes en español, natural, amable y directo.
-Objetivo: vender y ayudar a elegir el producto correcto.
-
-Reglas:
-- Si te saludan: te presentas corto.
-- Si preguntan por precio/stock: responde usando el catálogo (Precio_1 y SaldoGeneral).
-- Si hay varias coincidencias: pregunta una aclaración corta (marca/modelo/código) y ofrece 2-3 opciones.
-- Si NO encuentras el producto: pide un dato (marca/modelo/código) y ofrece alternativas por grupo si aplica.
-- No inventes precios ni stock: si no está en catálogo di "no lo tengo en el listado".
-- Formato recomendado: 2-6 líneas máximo, con bullets si es necesario.`,
-      },
-      {
-        role: "system",
-        content:
-          `CATÁLOGO (coincidencias para esta conversación):
-${catalogContext}`,
-      },
+      { role: "system", content: systemRules },
+      { role: "system", content: catalogSystem },
       { role: "user", content: userText },
     ],
-    temperature: 0.4,
   });
 
   return (
@@ -168,8 +160,9 @@ ${catalogContext}`,
   );
 }
 
-
-// ✅ Send WhatsApp text
+/* =========================
+   WhatsApp send
+========================= */
 async function sendWhatsAppText(to, text) {
   const token = process.env.WHATSAPP_TOKEN;
   const phoneNumberId = process.env.PHONE_NUMBER_ID;
@@ -201,44 +194,81 @@ async function sendWhatsAppText(to, text) {
   console.log("📤 WhatsApp send response:", resp.status, data);
 }
 
-// ✅ Meta events (POST)
+/* =========================
+   Routes
+========================= */
+
+// Home
+app.get("/", (req, res) => res.status(200).send("OK"));
+
+// Webhook verify
+app.get("/webhook", (req, res) => {
+  const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
+
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// Webhook events
 app.post("/webhook", async (req, res) => {
   try {
-    console.log("📩 Webhook event:", JSON.stringify(req.body, null, 2));
+    // IMPORTANTE: responder 200 rápido a Meta
+    res.sendStatus(200);
 
     const entry = req.body?.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
 
     const messages = value?.messages;
-    if (!messages || messages.length === 0) {
-      return res.sendStatus(200);
-    }
+    if (!messages || messages.length === 0) return;
 
     const from = messages[0]?.from;
     const text = messages[0]?.text?.body || "";
 
+    if (!from || !text) return;
+
     console.log("✅ Incoming message:", { from, text });
 
-    // ✅ NUEVO: intento cargar catálogo
-    let catalog = null;
+    // 1) Intentar cargar catálogo UNA sola vez por mensaje (con fallback)
+    let catalogOk = false;
+    let catalogContextText = "";
     try {
-      catalog = await loadCatalogFromXlsx(); // tu función existente
+      await loadCatalogFromXlsx();
+      const matches = searchCatalog(text, 6);
+      catalogContextText = formatItemsForPrompt(matches);
+      catalogOk = true;
     } catch (e) {
       console.error("⚠️ Catalog not available, continuing without it:", e?.message);
+      catalogOk = false;
+      catalogContextText = "";
     }
 
-    // ✅ OpenAI responde con o sin catálogo
-    const aiReply = await askOpenAI(text, catalog);
-    await sendWhatsAppText(from, aiReply);
+    // 2) OpenAI con fallback
+    let aiReply = "";
+    try {
+      aiReply = await askOpenAI(text, catalogContextText, catalogOk);
+    } catch (e) {
+      console.error("⚠️ OpenAI failed, using fallback:", e?.message);
+      aiReply =
+        "Hola 👋 Soy BK GLOBAL. En este momento tengo una falla técnica, pero dime el código o nombre del producto y te ayudo.";
+    }
 
-    return res.sendStatus(200);
+    // 3) Enviar WhatsApp
+    await sendWhatsAppText(from, aiReply);
   } catch (err) {
     console.log("❌ Error in webhook:", err);
-    return res.sendStatus(200);
+    // ya respondimos 200 arriba, no hacemos nada más
   }
 });
 
-
+/* =========================
+   Start
+========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
