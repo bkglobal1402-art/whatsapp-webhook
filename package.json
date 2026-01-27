@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp_webhook",
+  "name": "whatsapp-webhook",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
