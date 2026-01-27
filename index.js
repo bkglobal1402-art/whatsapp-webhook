@@ -220,7 +220,16 @@ app.post("/webhook", async (req, res) => {
 
     console.log("✅ Incoming message:", { from, text });
 
-    const aiReply = await askOpenAI(text);
+    // ✅ NUEVO: intento cargar catálogo
+    let catalog = null;
+    try {
+      catalog = await loadCatalogFromXlsx(); // tu función existente
+    } catch (e) {
+      console.error("⚠️ Catalog not available, continuing without it:", e?.message);
+    }
+
+    // ✅ OpenAI responde con o sin catálogo
+    const aiReply = await askOpenAI(text, catalog);
     await sendWhatsAppText(from, aiReply);
 
     return res.sendStatus(200);
@@ -229,6 +238,7 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
