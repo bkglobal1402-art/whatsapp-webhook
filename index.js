@@ -1,3 +1,10 @@
+process.on("uncaughtException", (err) => {
+  console.error("🔥 uncaughtException:", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("🔥 unhandledRejection:", err);
+});
+
 const express = require("express");
 const fetch = require("node-fetch");
 const OpenAI = require("openai");
