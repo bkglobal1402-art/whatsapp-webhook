@@ -8,9 +8,101 @@ process.on("unhandledRejection", (err) => {
 const express = require("express");
 const fetch = require("node-fetch");
 const OpenAI = require("openai");
+const XLSX = require("xlsx");
+const Fuse = require("fuse.js");
 
 const app = express();
 app.use(express.json());
+
+let catalogCache = {
+  rows: [],
+  updatedAt: 0,
+  fuse: null,
+};
+
+function normalizeText(s = "") {
+  return String(s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function loadCatalogFromXlsx() {
+  const url = process.env.CATALOG_XLSX_URL;
+  if (!url) {
+    console.log("❌ Missing CATALOG_XLSX_URL");
+    return;
+  }
+
+  // refrescar cada 5 min
+  const now = Date.now();
+  const FIVE_MIN = 5 * 60 * 1000;
+  if (catalogCache.rows.length > 0 && now - catalogCache.updatedAt < FIVE_MIN) return;
+
+  console.log("📦 Downloading XLSX catalog...");
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to download XLSX: ${resp.status}`);
+
+  const buf = await resp.buffer();
+  const wb = XLSX.read(buf, { type: "buffer" });
+
+  // Usa la primera hoja (o cámbiala por nombre si quieres)
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+  // Espera columnas: Codigo, Producto, Precio_1, SaldoGeneral, Nombre_Grupo
+  const normalizedRows = rows
+    .filter(r => r.Codigo || r.Producto)
+    .map(r => ({
+      Codigo: String(r.Codigo || "").trim(),
+      Producto: String(r.Producto || "").trim(),
+      Precio_1: String(r.Precio_1 || "").trim(),
+      SaldoGeneral: String(r.SaldoGeneral || "").trim(),
+      Nombre_Grupo: String(r.Nombre_Grupo || "").trim(),
+      _q: normalizeText(`${r.Codigo} ${r.Producto} ${r.Nombre_Grupo}`),
+    }));
+
+  const fuse = new Fuse(normalizedRows, {
+    includeScore: true,
+    threshold: 0.35, // más bajo = más estricto
+    keys: ["Codigo", "Producto", "_q", "Nombre_Grupo"],
+  });
+
+  catalogCache = {
+    rows: normalizedRows,
+    updatedAt: Date.now(),
+    fuse,
+  };
+
+  console.log(`✅ Catalog loaded: ${normalizedRows.length} items (sheet: ${sheetName})`);
+}
+
+function searchCatalog(query, limit = 5) {
+  if (!catalogCache.fuse) return [];
+  const q = normalizeText(query);
+
+  // si el usuario escribe un código exacto, primero intentamos match exacto
+  const exact = catalogCache.rows.find(r => r.Codigo && r.Codigo === query.trim());
+  if (exact) return [exact];
+
+  const results = catalogCache.fuse.search(q).slice(0, limit);
+  return results.map(r => r.item);
+}
+
+function formatItemsForPrompt(items) {
+  if (!items || items.length === 0) return "No encontré coincidencias en el catálogo.";
+
+  return items
+    .map((p, i) => {
+      return `${i + 1}) Codigo: ${p.Codigo} | Producto: ${p.Producto} | Precio_1: ${p.Precio_1} | Stock(SaldoGeneral): ${p.SaldoGeneral} | Grupo: ${p.Nombre_Grupo}`;
+    })
+    .join("\n");
+}
+
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -33,15 +125,37 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ✅ OpenAI helper
 async function askOpenAI(userText) {
+  // 1) asegúrate de tener catálogo
+  await loadCatalogFromXlsx();
+
+  // 2) busca productos relacionados con lo que preguntó el cliente
+  const matches = searchCatalog(userText, 6);
+  const catalogContext = formatItemsForPrompt(matches);
+
   const r = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     messages: [
       {
         role: "system",
         content:
-          "Eres un asesor de BK GLOBAL. Respondes en español, claro, corto y amable. Si te saludan, te presentas.",
+          `Eres un asesor comercial de BK GLOBAL (Colombia).
+Respondes en español, natural, amable y directo.
+Objetivo: vender y ayudar a elegir el producto correcto.
+
+Reglas:
+- Si te saludan: te presentas corto.
+- Si preguntan por precio/stock: responde usando el catálogo (Precio_1 y SaldoGeneral).
+- Si hay varias coincidencias: pregunta una aclaración corta (marca/modelo/código) y ofrece 2-3 opciones.
+- Si NO encuentras el producto: pide un dato (marca/modelo/código) y ofrece alternativas por grupo si aplica.
+- No inventes precios ni stock: si no está en catálogo di "no lo tengo en el listado".
+- Formato recomendado: 2-6 líneas máximo, con bullets si es necesario.`,
+      },
+      {
+        role: "system",
+        content:
+          `CATÁLOGO (coincidencias para esta conversación):
+${catalogContext}`,
       },
       { role: "user", content: userText },
     ],
@@ -50,9 +164,10 @@ async function askOpenAI(userText) {
 
   return (
     r.choices?.[0]?.message?.content?.trim() ||
-    "Hola 👋 Soy BK GLOBAL. ¿En qué puedo ayudarte?"
+    "Hola 👋 Soy BK GLOBAL. ¿Qué producto estás buscando?"
   );
 }
+
 
 // ✅ Send WhatsApp text
 async function sendWhatsAppText(to, text) {
