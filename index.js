@@ -26,7 +26,7 @@ function normalizeText(s = "") {
 function cleanQuery(raw = "") {
   return normalizeText(raw)
     .replace(
-      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto)\b/g,
+      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto|tendras|tendrian)\b/g,
       ""
     )
     .replace(/\s+/g, " ")
@@ -69,24 +69,6 @@ function formatOneProduct(p) {
   return `${p.Producto}\nPrecio: ${p.Precio_1}\n${availabilityText(p.SaldoGeneral)}`;
 }
 
-/* =========================
-   Variant detection (general)
-========================= */
-// Regla de variante iPhone: si en resultados hay "7 plus" y "iphone 7" (sin plus), preguntamos.
-function hasIphone7VariantMix(items) {
-  const plus = items.some((p) => normalizeText(p.Producto).includes("7 plus"));
-  const normal7 = items.some((p) => normalizeText(p.Producto).includes("iphone 7") && !normalizeText(p.Producto).includes("7 plus"));
-  return plus && normal7;
-}
-
-function pickIphone7Variant(items, answerText) {
-  const t = normalizeText(answerText);
-  const wantsPlus = t.includes("plus");
-  if (wantsPlus) return items.filter((p) => normalizeText(p.Producto).includes("7 plus"));
-  // si responde "7" o "normal"
-  return items.filter((p) => normalizeText(p.Producto).includes("iphone 7") && !normalizeText(p.Producto).includes("7 plus"));
-}
-
 function hasColorMix(items) {
   const hasWhite = items.some((p) => normalizeText(p.Producto).includes("blanco"));
   const hasBlack = items.some((p) => normalizeText(p.Producto).includes("negro"));
@@ -99,13 +81,75 @@ function filterByColor(items, color) {
 }
 
 /* =========================
+   Variant engine (general)
+   - Pregunta SOLO si hay más de una variante real entre los resultados.
+   - Variantes soportadas: pro max, pro, mini, plus, max, ultra, lite, se
+========================= */
+const VARIANT_PATTERNS = [
+  { key: "PRO MAX", patterns: ["pro max", "promax"] },
+  { key: "PRO", patterns: [" pro "] }, // con espacios para no confundir
+  { key: "MINI", patterns: [" mini "] },
+  { key: "PLUS", patterns: [" plus "] },
+  { key: "MAX", patterns: [" max "] },
+  { key: "ULTRA", patterns: [" ultra "] },
+  { key: "LITE", patterns: [" lite "] },
+  { key: "SE", patterns: [" se "] },
+];
+
+// detecta si el usuario YA dijo una variante en el mensaje
+function detectVariantFromText(text) {
+  const t = ` ${normalizeText(text)} `;
+  for (const v of VARIANT_PATTERNS) {
+    for (const p of v.patterns) {
+      const pp = p.startsWith(" ") ? p : ` ${p} `;
+      if (t.includes(pp)) return v.key;
+    }
+  }
+  return null;
+}
+
+// clasifica un producto en una variante (si aplica). Si no aplica, null.
+function classifyVariantFromProductName(productName) {
+  const t = ` ${normalizeText(productName)} `;
+  for (const v of VARIANT_PATTERNS) {
+    for (const p of v.patterns) {
+      const pp = p.startsWith(" ") ? p : ` ${p} `;
+      if (t.includes(pp)) return v.key;
+    }
+  }
+  return null;
+}
+
+// construye opciones reales de variante según los matches
+function computeVariantOptions(items) {
+  const map = new Map(); // key -> items[]
+  for (const p of items) {
+    const key = classifyVariantFromProductName(p.Producto);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(p);
+  }
+
+  // Solo tiene sentido preguntar si hay 2+ variantes distintas
+  const keys = Array.from(map.keys());
+  if (keys.length < 2) return null;
+
+  // Ordenar por el orden de VARIANT_PATTERNS
+  const order = new Map(VARIANT_PATTERNS.map((v, i) => [v.key, i]));
+  keys.sort((a, b) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
+
+  return { keys, map };
+}
+
+/* =========================
    Session memory (RAM)
 ========================= */
 const sessions = new Map();
 /*
 sessions.get(from) = {
-  pending: "iphone_7_variant" | "color",
-  items: [...]
+  pending: "variant" | "color",
+  items: [...],          // items actuales filtrados
+  variantKeys?: [...],   // variantes disponibles para mostrar
 }
 */
 
@@ -156,7 +200,17 @@ async function loadCatalogFromCSV() {
   const rows = records
     .map((r) => {
       const Codigo = pick(r, "Codigo", "CODIGO", "Código", "code", "sku", "referencia");
-      const Producto = pick(r, "Producto", "PRODUCTO", "Nombre_Producto", "Nombre", "Descripcion", "Descripción", "description", "name");
+      const Producto = pick(
+        r,
+        "Producto",
+        "PRODUCTO",
+        "Nombre_Producto",
+        "Nombre",
+        "Descripcion",
+        "Descripción",
+        "description",
+        "name"
+      );
       const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio", "price");
       const SaldoGeneral = pick(r, "SaldoGeneral", "Saldo General", "Stock", "Existencias", "Inventario");
       const Nombre_Grupo = pick(r, "Nombre_Grupo", "Nombre Grupo", "Grupo", "Categoria", "Categoría");
@@ -185,13 +239,12 @@ async function loadCatalogFromCSV() {
   return catalogCache;
 }
 
-function searchCatalog(query, limit = 15) {
+function searchCatalog(query, limit = 20) {
   if (!catalogCache.fuse) return [];
 
   const raw = String(query || "").trim();
   const q = cleanQuery(raw);
 
-  // exact por código
   const exact = catalogCache.rows.find(
     (r) => normalizeText(r.Codigo) && normalizeText(r.Codigo) === normalizeText(raw)
   );
@@ -237,7 +290,7 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   OpenAI (solo para conversación cuando NO hay match)
+   OpenAI (solo si NO hay match)
 ========================= */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -248,7 +301,7 @@ async function askOpenAI(userText) {
 Eres asesor comercial de BK GLOBAL.
 Responde en español natural, corto y claro (máx 5 líneas).
 No inventes precios ni disponibilidad.
-Si falta información del cliente, haz 1 pregunta para aclarar.
+Si falta información, haz 1 pregunta para aclarar.
 `;
 
   const r = await openai.chat.completions.create({
@@ -300,30 +353,38 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Si estamos en aclaración (7 vs 7 Plus)
+    // Si hay sesión pendiente (VARIANTE / COLOR)
     const sess = sessions.get(from);
-    if (sess?.pending === "iphone_7_variant") {
-      const refined = pickIphone7Variant(sess.items || [], text);
-      if (refined.length === 0) {
-        sessions.delete(from);
-        await sendWhatsAppText(from, "Perfecto. ¿Me confirmas el modelo exacto nuevamente para ayudarte?");
+
+    if (sess?.pending === "variant") {
+      const userVariant = detectVariantFromText(text);
+      if (!userVariant) {
+        const list = (sess.variantKeys || []).join(", ");
+        await sendWhatsAppText(from, `Perfecto 👌 ¿Cuál necesitas: ${list}?`);
         return;
       }
 
-      // luego color si aplica
-      if (hasColorMix(refined) && !detectColor(text)) {
-        sessions.set(from, { pending: "color", items: refined });
+      // filtrar por variante
+      const filtered = (sess.items || []).filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
+
+      if (filtered.length === 0) {
+        const list = (sess.variantKeys || []).join(", ");
+        await sendWhatsAppText(from, `No te entendí esa variante. ¿Cuál necesitas: ${list}?`);
+        return;
+      }
+
+      // después de variante: si hay color, preguntar
+      if (hasColorMix(filtered) && !detectColor(text)) {
+        sessions.set(from, { pending: "color", items: filtered });
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
 
-      // si no hay mezcla de color, responder
-      await sendWhatsAppText(from, formatOneProduct(refined[0]));
+      await sendWhatsAppText(from, formatOneProduct(filtered[0]));
       sessions.delete(from);
       return;
     }
 
-    // Si estamos en aclaración de color
     if (sess?.pending === "color") {
       const color = detectColor(text);
       if (!color) {
@@ -342,42 +403,55 @@ app.post("/webhook", async (req, res) => {
 
     // Cargar catálogo y buscar
     await loadCatalogFromCSV();
-    const matches = searchCatalog(text, 20);
+    const matches = searchCatalog(text, 25);
 
     console.log("🔎 Search raw:", text);
     console.log("🔎 Search clean:", cleanQuery(text));
     console.log("🔎 Matches:", matches.slice(0, 3));
 
-    // Si no hay match: conversación natural (pregunta 1 cosa)
+    // Si no hay match: conversación natural (1 pregunta)
     if (matches.length === 0) {
       const reply = await askOpenAI(text);
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Si el usuario pide precio/disponibilidad:
+    // Si el usuario pide precio/disponibilidad, aplicamos “inteligencia de variantes”
     if (asksPriceOrAvailability(text)) {
-      // 1) Si hay mezcla iPhone 7 vs 7 Plus, preguntar primero
-      if (hasIphone7VariantMix(matches) && !normalizeText(text).includes("plus")) {
-        sessions.set(from, { pending: "iphone_7_variant", items: matches });
-        await sendWhatsAppText(from, "Perfecto 👌 ¿Es iPhone 7 normal o iPhone 7 Plus?");
+      const userVariant = detectVariantFromText(text);
+
+      // Si ya dijo variante, filtrar por ella
+      let refined = matches;
+      if (userVariant) {
+        const filtered = matches.filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
+        if (filtered.length > 0) refined = filtered;
+      }
+
+      // 1) Si hay mezcla de variantes y el usuario NO especificó -> preguntar variante (con lista real)
+      const variantOptions = computeVariantOptions(refined);
+      if (!userVariant && variantOptions) {
+        sessions.set(from, {
+          pending: "variant",
+          items: refined,
+          variantKeys: variantOptions.keys,
+        });
+        await sendWhatsAppText(from, `Perfecto 👌 ¿Cuál necesitas: ${variantOptions.keys.join(", ")}?`);
         return;
       }
 
-      // 2) Si hay mezcla de color, preguntar color
-      if (hasColorMix(matches) && !detectColor(text)) {
-        sessions.set(from, { pending: "color", items: matches });
+      // 2) Si hay mezcla de colores -> preguntar color
+      if (hasColorMix(refined) && !detectColor(text)) {
+        sessions.set(from, { pending: "color", items: refined });
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
 
-      // 3) Responder directo con la mejor opción (sin cantidades)
-      await sendWhatsAppText(from, formatOneProduct(matches[0]));
+      // 3) Responder con el mejor match (sin cantidades)
+      await sendWhatsAppText(from, formatOneProduct(refined[0]));
       return;
     }
 
-    // Si no pidió precio, pero hay matches:
-    // Mostrar 2–3 opciones y preguntar cuál (sin vender “líneas”)
+    // Si NO pidió precio: mostrar 2–3 opciones y preguntar cuál
     const options = matches.slice(0, 3).map((p, i) => `${i + 1}) ${p.Producto}`).join("\n");
     await sendWhatsAppText(from, `Encontré estas opciones:\n${options}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`);
   } catch (err) {
