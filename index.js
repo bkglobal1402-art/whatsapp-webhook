@@ -40,13 +40,6 @@ function isGreeting(text) {
   );
 }
 
-function asksPriceOrAvailability(text) {
-  const t = normalizeText(text);
-  return ["precio", "vale", "cuesta", "disponible", "hay", "existencia", "stock", "tienen"].some((w) =>
-    t.includes(w)
-  );
-}
-
 function detectColor(text) {
   const t = normalizeText(text);
   if (t.includes("negro")) return "NEGRO";
@@ -69,6 +62,30 @@ function formatOneProduct(p) {
   return `${p.Producto}\nPrecio: ${p.Precio_1}\n${availabilityText(p.SaldoGeneral)}`;
 }
 
+function isNumericChoice(text) {
+  const t = String(text || "").trim();
+  return t === "1" || t === "2" || t === "3";
+}
+
+function looksLikeCode(text) {
+  const t = String(text || "").trim();
+  return /^\d{4,}$/.test(t);
+}
+
+function wantsOthers(text) {
+  const t = normalizeText(text);
+  return (
+    t.includes("las otras") ||
+    t.includes("las demas") ||
+    t.includes("las demás") ||
+    t.includes("las restantes") ||
+    t.includes("todas") ||
+    t.includes("precio de las otras") ||
+    t.includes("precio de las demas") ||
+    t.includes("precio de las demás")
+  );
+}
+
 function hasColorMix(items) {
   const hasWhite = items.some((p) => normalizeText(p.Producto).includes("blanco"));
   const hasBlack = items.some((p) => normalizeText(p.Producto).includes("negro"));
@@ -80,19 +97,8 @@ function filterByColor(items, color) {
   return items.filter((p) => normalizeText(p.Producto).includes(c));
 }
 
-function isNumericChoice(text) {
-  const t = String(text || "").trim();
-  return t === "1" || t === "2" || t === "3";
-}
-
-function looksLikeCode(text) {
-  // si escribe un código de producto (ej 103924)
-  const t = String(text || "").trim();
-  return /^\d{4,}$/.test(t);
-}
-
 /* =========================
-   Variant engine (general)
+   Variant engine (solo celulares)
 ========================= */
 const VARIANT_PATTERNS = [
   { key: "PRO MAX", patterns: ["pro max", "promax"] },
@@ -128,7 +134,7 @@ function classifyVariantFromProductName(productName) {
 }
 
 function computeVariantOptions(items) {
-  const map = new Map(); // key -> items[]
+  const map = new Map();
   for (const p of items) {
     const key = classifyVariantFromProductName(p.Producto);
     if (!key) continue;
@@ -140,8 +146,29 @@ function computeVariantOptions(items) {
 
   const order = new Map(VARIANT_PATTERNS.map((v, i) => [v.key, i]));
   keys.sort((a, b) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
-
   return { keys, map };
+}
+
+function isCellphoneContext(items, userText) {
+  const t = normalizeText(userText);
+  // Si el usuario menciona marcas/modelos típicos o si el grupo parece celulares
+  const userMentionsPhone =
+    t.includes("iphone") ||
+    t.includes("samsung") ||
+    t.includes("huawei") ||
+    t.includes("xiaomi") ||
+    t.includes("motorola") ||
+    t.includes("oppo") ||
+    t.includes("vivo") ||
+    t.includes("infinix") ||
+    t.includes("tecno");
+
+  const groupLooksPhone = (items || []).some((p) => {
+    const g = normalizeText(p.Nombre_Grupo || "");
+    return g.includes("repuestos celulares") || g.includes("celular") || g.includes("telefon");
+  });
+
+  return userMentionsPhone || groupLooksPhone;
 }
 
 /* =========================
@@ -151,9 +178,10 @@ const sessions = new Map();
 /*
 sessions.get(from) = {
   pending: "variant" | "color" | "pick",
-  items: [...],        // items actuales filtrados
+  items: [...],
   variantKeys?: [...],
-  lastOptions?: [...], // últimos 1..3 mostrados
+  lastOptions?: [...],
+  lastTopicKey?: string, // "cerraduras" / "gps" / etc (según Nombre_Grupo)
 }
 */
 
@@ -172,9 +200,7 @@ function pick(r, ...names) {
       .replace(/[\u0300-\u036f]/g, "")
       .replace(/\s+/g, "")
       .trim();
-
   const map = new Map(keys.map((k) => [normKey(k), k]));
-
   for (const n of names) {
     const realKey = map.get(normKey(n));
     if (realKey && r[realKey] != null && String(r[realKey]).trim() !== "") {
@@ -192,30 +218,18 @@ async function loadCatalogFromCSV() {
   if (catalogCache.rows.length > 0 && now - catalogCache.updatedAt < FIVE_MIN) return catalogCache;
 
   console.log("📦 Downloading catalog from Google Sheets (CSV)...");
-
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to download CSV: ${resp.status}`);
 
   const csvText = await resp.text();
   const records = parse(csvText, { columns: true, skip_empty_lines: true });
-
   console.log("🧾 CSV headers:", Object.keys(records[0] || {}));
 
   const rows = records
     .map((r) => {
       const Codigo = pick(r, "Codigo", "CODIGO", "Código", "code", "sku", "referencia");
-      const Producto = pick(
-        r,
-        "Producto",
-        "PRODUCTO",
-        "Nombre_Producto",
-        "Nombre",
-        "Descripcion",
-        "Descripción",
-        "description",
-        "name"
-      );
-      const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio", "price");
+      const Producto = pick(r, "Producto", "PRODUCTO", "Nombre_Producto", "Nombre", "Descripcion", "Descripción");
+      const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio");
       const SaldoGeneral = pick(r, "SaldoGeneral", "Saldo General", "Stock", "Existencias", "Inventario");
       const Nombre_Grupo = pick(r, "Nombre_Grupo", "Nombre Grupo", "Grupo", "Categoria", "Categoría");
 
@@ -260,6 +274,30 @@ function searchCatalog(query, limit = 25) {
 }
 
 /* =========================
+   OpenAI SOLO si no hay match
+========================= */
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+async function askOpenAI(userText) {
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const systemRules = `
+Eres asesor comercial de BK GLOBAL.
+Responde en español natural, corto y claro (máx 4 líneas).
+No inventes precios ni disponibilidad.
+Haz 1 sola pregunta para aclarar.
+`;
+  const r = await openai.chat.completions.create({
+    model,
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: systemRules },
+      { role: "user", content: userText },
+    ],
+  });
+  return r.choices?.[0]?.message?.content?.trim() || "¿Me confirmas el modelo exacto para ayudarte? 🙂";
+}
+
+/* =========================
    WhatsApp sender
 ========================= */
 async function sendWhatsAppText(to, text) {
@@ -294,33 +332,6 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   OpenAI (solo si NO hay match)
-========================= */
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-async function askOpenAI(userText) {
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  const systemRules = `
-Eres asesor comercial de BK GLOBAL.
-Responde en español natural, corto y claro (máx 5 líneas).
-No inventes precios ni disponibilidad.
-Si falta información, haz 1 pregunta para aclarar.
-`;
-
-  const r = await openai.chat.completions.create({
-    model,
-    temperature: 0.4,
-    messages: [
-      { role: "system", content: systemRules },
-      { role: "user", content: userText },
-    ],
-  });
-
-  return r.choices?.[0]?.message?.content?.trim() || "¿En qué te puedo ayudar? 🙂";
-}
-
-/* =========================
    Routes
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
@@ -351,19 +362,29 @@ app.post("/webhook", async (req, res) => {
 
     console.log("✅ Incoming message:", { from, text });
 
-    // Saludo opción 1
     if (isGreeting(text)) {
       await sendWhatsAppText(from, "Hola 👋 ¿En qué te puedo ayudar?");
       return;
     }
 
-    // Asegurar catálogo cargado (para cualquier flujo)
     await loadCatalogFromCSV();
 
-    // Si hay sesión pendiente (PICK / VARIANTE / COLOR)
     const sess = sessions.get(from);
 
-    // 1) Si el bot mostró opciones 1..3 y el cliente responde "1/2/3" o un código
+    /* ===== 1) Follow-up: "las otras / todas" dentro del mismo contexto ===== */
+    if (sess?.lastOptions?.length && wantsOthers(text)) {
+      // si el cliente ya eligió 1 antes, aquí mostramos 2 y 3
+      const remaining = sess.lastOptions.slice(1); // 2 y 3
+      if (remaining.length === 0) {
+        await sendWhatsAppText(from, "Perfecto 👌 ¿Cuál otra opción te interesa?");
+        return;
+      }
+      const lines = remaining.map((p, i) => `${i + 2}) ${formatOneProduct(p)}`).join("\n\n");
+      await sendWhatsAppText(from, `Claro, aquí están las otras:\n\n${lines}`);
+      return;
+    }
+
+    /* ===== 2) Si estamos esperando selección 1/2/3 (sin desviarse) ===== */
     if (sess?.pending === "pick" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
       const t = String(text || "").trim();
 
@@ -371,15 +392,9 @@ app.post("/webhook", async (req, res) => {
         const idx = Number(t) - 1;
         const chosen = sess.lastOptions[idx];
         if (chosen) {
-          // Si después del “pick” hay color mezclado, preguntar color
-          if (hasColorMix([chosen]) === false) {
-            await sendWhatsAppText(from, formatOneProduct(chosen));
-            sessions.delete(from);
-            return;
-          }
-          // (normalmente un solo ítem no tiene mezcla de color, pero lo dejamos por seguridad)
           await sendWhatsAppText(from, formatOneProduct(chosen));
-          sessions.delete(from);
+          // mantenemos el contexto para que "las otras" funcione
+          sessions.set(from, { ...sess, pending: null });
           return;
         }
       }
@@ -388,43 +403,30 @@ app.post("/webhook", async (req, res) => {
         const byCode = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(t));
         if (byCode) {
           await sendWhatsAppText(from, formatOneProduct(byCode));
-          sessions.delete(from);
+          sessions.set(from, { ...sess, pending: null });
           return;
         }
       }
 
-      // Si escribió texto (ej “me refería a la cerradura securepro 100”), intentamos match dentro de las opciones mostradas
-      const nt = normalizeText(t);
-      const best = sess.lastOptions.find((p) => normalizeText(p.Producto).includes(nt) || nt.includes(normalizeText(p.Producto)));
-      if (best) {
-        await sendWhatsAppText(from, formatOneProduct(best));
-        sessions.delete(from);
-        return;
-      }
-
-      // Si no entendimos, repetir instrucción
       await sendWhatsAppText(from, "Perfecto 👌 Responde con 1, 2, 3 o el código del producto.");
       return;
     }
 
-    // 2) Variante
+    /* ===== 3) Variante/color pendientes (solo si era celulares) ===== */
     if (sess?.pending === "variant") {
       const userVariant = detectVariantFromText(text);
       if (!userVariant) {
-        const list = (sess.variantKeys || []).join(", ");
-        await sendWhatsAppText(from, `Perfecto 👌 ¿Cuál necesitas: ${list}?`);
+        await sendWhatsAppText(from, `Perfecto 👌 ¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`);
         return;
       }
-
       const filtered = (sess.items || []).filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
       if (filtered.length === 0) {
-        const list = (sess.variantKeys || []).join(", ");
-        await sendWhatsAppText(from, `No te entendí esa variante. ¿Cuál necesitas: ${list}?`);
+        await sendWhatsAppText(from, `¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`);
         return;
       }
 
       if (hasColorMix(filtered) && !detectColor(text)) {
-        sessions.set(from, { pending: "color", items: filtered });
+        sessions.set(from, { ...sess, pending: "color", items: filtered });
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
@@ -434,44 +436,61 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 3) Color
     if (sess?.pending === "color") {
       const color = detectColor(text);
       if (!color) {
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
-
       const chosen = filterByColor(sess.items || [], color);
       if (chosen.length === 0) {
-        await sendWhatsAppText(from, `En ${color} no lo veo disponible. ¿Lo quieres en BLANCO o NEGRO?`);
+        await sendWhatsAppText(from, `En ${color} no lo veo. ¿BLANCO o NEGRO?`);
         return;
       }
-
       await sendWhatsAppText(from, formatOneProduct(chosen[0]));
       sessions.delete(from);
       return;
     }
 
-    // Buscar en catálogo
-    const matches = searchCatalog(text, 25);
+    /* ===== 4) Búsqueda normal (pero si hay contexto, priorizamos NO desviarnos) ===== */
+    let matches = searchCatalog(text, 30);
+
+    // Si veníamos de un tema (ej cerraduras) y el texto es genérico ("las cerraduras", "las otras", etc.)
+    // reforzamos el contexto filtrando por el mismo grupo de las últimas opciones.
+    if (sess?.lastTopicKey) {
+      const tnorm = normalizeText(text);
+      const isGenericFollowup =
+        tnorm.length <= 25 ||
+        tnorm.includes("las cerraduras") ||
+        tnorm.includes("cerraduras") ||
+        tnorm.includes("las otras") ||
+        tnorm.includes("las demas") ||
+        tnorm.includes("las demás") ||
+        tnorm.includes("todas");
+
+      if (isGenericFollowup) {
+        const filtered = matches.filter((p) => normalizeText(p.Nombre_Grupo || "") === sess.lastTopicKey);
+        if (filtered.length > 0) matches = filtered;
+      }
+    }
 
     console.log("🔎 Search raw:", text);
     console.log("🔎 Search clean:", cleanQuery(text));
     console.log("🔎 Matches:", matches.slice(0, 3));
 
-    // Si no hay match: conversación natural (1 pregunta)
     if (matches.length === 0) {
       const reply = await askOpenAI(text);
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Si pide precio/disponibilidad: aplicar reglas de variante/color y responder
-    if (asksPriceOrAvailability(text)) {
-      const userVariant = detectVariantFromText(text);
+    // Variantes SOLO si es contexto celulares
+    const allowVariants = isCellphoneContext(matches, text);
 
+    if (allowVariants) {
+      const userVariant = detectVariantFromText(text);
       let refined = matches;
+
       if (userVariant) {
         const filtered = matches.filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
         if (filtered.length > 0) refined = filtered;
@@ -479,11 +498,7 @@ app.post("/webhook", async (req, res) => {
 
       const variantOptions = computeVariantOptions(refined);
       if (!userVariant && variantOptions) {
-        sessions.set(from, {
-          pending: "variant",
-          items: refined,
-          variantKeys: variantOptions.keys,
-        });
+        sessions.set(from, { pending: "variant", items: refined, variantKeys: variantOptions.keys });
         await sendWhatsAppText(from, `Perfecto 👌 ¿Cuál necesitas: ${variantOptions.keys.join(", ")}?`);
         return;
       }
@@ -493,21 +508,28 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
+    }
 
-      await sendWhatsAppText(from, formatOneProduct(refined[0]));
+    // Si el usuario pide directamente el precio de algo encontrado y hay un match claro:
+    const directPriceAsk =
+      normalizeText(text).includes("precio") || normalizeText(text).includes("vale") || normalizeText(text).includes("cuesta");
+
+    if (directPriceAsk && matches.length === 1) {
+      await sendWhatsAppText(from, formatOneProduct(matches[0]));
+      // Guardar contexto
+      const topicKey = normalizeText(matches[0].Nombre_Grupo || "");
+      sessions.set(from, { lastOptions: [matches[0]], lastTopicKey: topicKey, pending: null });
       return;
     }
 
-    // Si NO pidió precio: mostrar 2–3 opciones y guardar en sesión para que "1" funcione
+    // Mostrar 3 opciones y GUARDAR contexto + opciones
     const lastOptions = matches.slice(0, 3);
+    const topicKey = normalizeText(lastOptions[0]?.Nombre_Grupo || "");
     const optionsText = lastOptions.map((p, i) => `${i + 1}) ${p.Producto}`).join("\n");
 
-    sessions.set(from, { pending: "pick", lastOptions });
+    sessions.set(from, { pending: "pick", lastOptions, lastTopicKey: topicKey });
 
-    await sendWhatsAppText(
-      from,
-      `Encontré estas opciones:\n${optionsText}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`
-    );
+    await sendWhatsAppText(from, `Encontré estas opciones:\n${optionsText}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`);
   } catch (err) {
     console.error("❌ Webhook error:", err);
   }
