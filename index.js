@@ -26,25 +26,11 @@ function normalizeText(s = "") {
 function cleanQuery(raw = "") {
   return normalizeText(raw)
     .replace(
-      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto|tendras|tendrian|muestrame|muestra|quiero saber)\b/g,
+      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto|muestrame|muestra|quiero saber|por favor|pf)\b/g,
       ""
     )
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function isGreeting(text) {
-  const t = normalizeText(text);
-  return ["hola", "buenas", "hey", "buenos dias", "buenas tardes", "buenas noches"].some(
-    (w) => t === w || t.startsWith(w + " ")
-  );
-}
-
-function detectColor(text) {
-  const t = normalizeText(text);
-  if (t.includes("negro")) return "NEGRO";
-  if (t.includes("blanco")) return "BLANCO";
-  return null;
 }
 
 function stockHasExistence(saldoGeneral) {
@@ -54,60 +40,26 @@ function stockHasExistence(saldoGeneral) {
   return n > 0;
 }
 
-function isNumericChoice(text) {
-  const t = String(text || "").trim();
-  return t === "1" || t === "2" || t === "3";
-}
-
 function looksLikeCode(text) {
   const t = String(text || "").trim();
   return /^\d{4,}$/.test(t);
 }
 
-function wantsOthers(text) {
+function detectColor(text) {
   const t = normalizeText(text);
-  return (
-    t.includes("las otras") ||
-    t.includes("las demas") ||
-    t.includes("las demás") ||
-    t.includes("las restantes") ||
-    t.includes("todas") ||
-    t.includes("toda") ||
-    t.includes("las 3") ||
-    t.includes("las tres") ||
-    t.includes("3 opciones") ||
-    t.includes("las opciones") ||
-    t.includes("precio de las otras") ||
-    t.includes("precio de todas") ||
-    t.includes("precio de toda") ||
-    t.includes("precio de las 3") ||
-    t.includes("precio de las tres") ||
-    t.includes("precio de las opciones")
-  );
+  if (t.includes("negro")) return "NEGRO";
+  if (t.includes("blanco")) return "BLANCO";
+  return null;
 }
 
 /* Quitar "TACTIL" de displays iPhone (para que no lo mencione) */
 function prettyProductName(name = "") {
-  let s = String(name);
-
-  // Si es display iPhone, quitar "TACTIL"
+  let s = String(name || "");
   const n = normalizeText(s);
   if (n.includes("display") && n.includes("iphone")) {
     s = s.replace(/t[aá]ctil/gi, "").replace(/\s+/g, " ").trim();
-    s = s.replace(/\s{2,}/g, " ").trim();
   }
   return s;
-}
-
-function hasColorMix(items) {
-  const hasWhite = items.some((p) => normalizeText(p.Producto).includes("blanco"));
-  const hasBlack = items.some((p) => normalizeText(p.Producto).includes("negro"));
-  return hasWhite && hasBlack;
-}
-
-function filterByColor(items, color) {
-  const c = normalizeText(color);
-  return items.filter((p) => normalizeText(p.Producto).includes(c));
 }
 
 /* =========================
@@ -162,6 +114,17 @@ function computeVariantOptions(items) {
   return { keys, map };
 }
 
+function hasColorMix(items) {
+  const hasWhite = items.some((p) => normalizeText(p.Producto).includes("blanco"));
+  const hasBlack = items.some((p) => normalizeText(p.Producto).includes("negro"));
+  return hasWhite && hasBlack;
+}
+
+function filterByColor(items, color) {
+  const c = normalizeText(color);
+  return items.filter((p) => normalizeText(p.Producto).includes(c));
+}
+
 function isCellphoneContext(items, userText) {
   const t = normalizeText(userText);
 
@@ -191,10 +154,10 @@ const sessions = new Map();
 /*
 sessions.get(from) = {
   pending: "pick" | "variant" | "color" | null,
-  items: [...],          // items actuales (si aplica)
+  items: [...],
   variantKeys?: [...],
-  lastOptions?: [...],   // últimas 1..3 mostradas
-  lastTopicKey?: string, // grupo normalizado
+  lastOptions?: [...],
+  lastTopicKey?: string
 }
 */
 
@@ -213,7 +176,9 @@ function pick(r, ...names) {
       .replace(/[\u0300-\u036f]/g, "")
       .replace(/\s+/g, "")
       .trim();
+
   const map = new Map(keys.map((k) => [normKey(k), k]));
+
   for (const n of names) {
     const realKey = map.get(normKey(n));
     if (realKey && r[realKey] != null && String(r[realKey]).trim() !== "") {
@@ -231,18 +196,30 @@ async function loadCatalogFromCSV() {
   if (catalogCache.rows.length > 0 && now - catalogCache.updatedAt < FIVE_MIN) return catalogCache;
 
   console.log("📦 Downloading catalog from Google Sheets (CSV)...");
+
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to download CSV: ${resp.status}`);
 
   const csvText = await resp.text();
+
   const records = parse(csvText, { columns: true, skip_empty_lines: true });
   console.log("🧾 CSV headers:", Object.keys(records[0] || {}));
 
   const rows = records
     .map((r) => {
       const Codigo = pick(r, "Codigo", "CODIGO", "Código", "code", "sku", "referencia");
-      const Producto = pick(r, "Producto", "PRODUCTO", "Nombre_Producto", "Nombre", "Descripcion", "Descripción");
-      const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio");
+      const Producto = pick(
+        r,
+        "Producto",
+        "PRODUCTO",
+        "Nombre_Producto",
+        "Nombre",
+        "Descripcion",
+        "Descripción",
+        "description",
+        "name"
+      );
+      const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio", "price");
       const SaldoGeneral = pick(r, "SaldoGeneral", "Saldo General", "Stock", "Existencias", "Inventario");
       const Nombre_Grupo = pick(r, "Nombre_Grupo", "Nombre Grupo", "Grupo", "Categoria", "Categoría");
 
@@ -276,9 +253,8 @@ function searchCatalog(query, limit = 30) {
   const raw = String(query || "").trim();
   const q = cleanQuery(raw);
 
-  const exact = catalogCache.rows.find(
-    (r) => normalizeText(r.Codigo) && normalizeText(r.Codigo) === normalizeText(raw)
-  );
+  // Match exacto por código
+  const exact = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(raw));
   if (exact) return [exact];
 
   if (!q) return [];
@@ -286,40 +262,131 @@ function searchCatalog(query, limit = 30) {
 }
 
 /* =========================
-   OpenAI (SIEMPRE)
-   - OpenAI SOLO redacta
-   - Datos vienen 100% del catálogo / estado
+   OpenAI
 ========================= */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-async function generateReplyWithOpenAI(payload) {
+function toSafeOption(p) {
+  return {
+    codigo: p.Codigo,
+    producto: prettyProductName(p.Producto),
+    precio: p.Precio_1,
+    existencia: stockHasExistence(p.SaldoGeneral) ? "HAY" : "NO_HAY",
+    grupo: p.Nombre_Grupo || "",
+  };
+}
+
+/**
+ * 1) CLASIFICADOR “DURO”: OpenAI devuelve SOLO JSON con intención.
+ * Esto evita que el bot se confunda con “precio de cada una”, “dame los precios”, etc.
+ */
+async function classifyIntentWithOpenAI({ userText, session }) {
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const system = `
+Eres un clasificador de intención para un bot de WhatsApp de BK GLOBAL.
+
+Devuelve SOLO JSON válido con estas llaves:
+{
+  "intent": "GREETING" | "PRICES_ALL_LISTED" | "PICK_OPTION" | "CODE_LOOKUP" | "SEARCH" | "ASK_CLARIFY" | "VARIANT" | "COLOR",
+  "choice_number": 1|2|3|null,
+  "code": "..."|null,
+  "variant": "PRO MAX"|"PRO"|"MINI"|"PLUS"|"MAX"|"ULTRA"|"LITE"|"SE"|null,
+  "color": "BLANCO"|"NEGRO"|null,
+  "search_hint": "..."|null
+}
+
+Reglas:
+- Si el usuario saluda (hola/buenas/hey/etc) => GREETING.
+- Si el usuario pide "precio de cada una", "precio de todas", "los precios", "cuanto valen", "precio de las opciones", "precio de las 3" => PRICES_ALL_LISTED (si hay lista activa).
+- Si el usuario dice "1", "2", "3", "la 2", "opcion 3" => PICK_OPTION y choice_number.
+- Si el usuario da un número largo tipo código/sku (>=4 dígitos) => CODE_LOOKUP y code.
+- Si el usuario menciona BLANCO/NEGRO => COLOR.
+- Si el usuario menciona PRO/MAX/PLUS/MINI/LITE/SE/ULTRA => VARIANT.
+- Si no es nada de lo anterior => SEARCH (usar search_hint como versión limpia del texto si puedes).
+- Si el texto es ambiguo y no hay contexto => ASK_CLARIFY.
+
+IMPORTANTE:
+- No inventes. Solo clasificas intención.
+`;
+
+  const sess = session || {};
+  const listed = Array.isArray(sess.lastOptions)
+    ? sess.lastOptions.map((p, i) => ({
+        n: i + 1,
+        producto: prettyProductName(p.Producto),
+        codigo: p.Codigo,
+      }))
+    : [];
+
+  const user = `
+USER_TEXT: ${userText}
+
+SESSION_STATE:
+- pending: ${sess.pending || "null"}
+- has_listed_options: ${listed.length > 0}
+- listed_options: ${JSON.stringify(listed)}
+- lastTopicKey: ${sess.lastTopicKey || "null"}
+
+Devuelve el JSON.
+`;
+
+  console.log("🧠 Intent classifier CALLED");
+
+  const r = await openai.chat.completions.create({
+    model,
+    temperature: 0,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  });
+
+  const txt = r.choices?.[0]?.message?.content?.trim() || "";
+  try {
+    const obj = JSON.parse(txt);
+    return obj || { intent: "SEARCH" };
+  } catch (e) {
+    console.error("⚠️ Intent JSON parse failed. Raw:", txt);
+    return { intent: "SEARCH" };
+  }
+}
+
+/**
+ * 2) GENERADOR DE RESPUESTA: OpenAI redacta SOLO con CATÁLOGO_DATA.
+ * - NO inventa precios
+ * - NUNCA muestra cantidades (solo hay/no hay)
+ * - Display iPhone: no menciona “táctil”
+ * - Respuesta corta
+ */
+async function generateReplyWithOpenAI({ userText, mode, catalogData, fallback }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const system = `
 Eres un asesor comercial de BK GLOBAL (Colombia) por WhatsApp.
 
-REGLAS CRÍTICAS (OBLIGATORIAS):
-- NO inventes precios, existencia, marcas o productos.
-- Usa ÚNICAMENTE los datos que vienen en el "CATALOGO_DATA".
+REGLAS CRÍTICAS:
+- NO inventes precios, existencia, productos o códigos.
+- Usa ÚNICAMENTE los datos del "CATALOGO_DATA".
 - NUNCA muestres cantidad de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
-- Si el producto es "DISPLAY" para "IPHONE": NO menciones la palabra "TACTIL" (asume que ya viene incluido).
-- Responde natural, corto y claro (máx 5 líneas).
-- Si faltan datos para decidir (ej color o variante), haz UNA sola pregunta clara.
-- Tu salida debe ser SOLO JSON válido: {"reply":"..."} (sin texto extra).
+- Si el producto es DISPLAY para IPHONE: NO menciones "TACTIL" (asume incluido).
+- Español natural, corto y claro (máx 5 líneas).
+- Si faltan datos (ej: color/variante), haz UNA sola pregunta clara.
+- Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
 `;
 
   const user = `
 USER_TEXT:
-${payload.userText}
+${userText}
 
-INSTRUCCION (MODE):
-${payload.mode}
+MODE:
+${mode}
 
-CATALOGO_DATA (solo esto se puede usar):
-${JSON.stringify(payload.catalogData, null, 2)}
+CATALOGO_DATA (única fuente):
+${JSON.stringify(catalogData, null, 2)}
 `;
 
-  console.log("🤖 OpenAI CALLED mode=", payload.mode);
+  console.log("🤖 OpenAI REPLY CALLED mode=", mode);
 
   const r = await openai.chat.completions.create({
     model,
@@ -335,10 +402,10 @@ ${JSON.stringify(payload.catalogData, null, 2)}
     const obj = JSON.parse(txt);
     if (obj && typeof obj.reply === "string" && obj.reply.trim()) return obj.reply.trim();
   } catch (e) {
-    console.error("⚠️ OpenAI JSON parse failed. Raw:", txt);
+    console.error("⚠️ Reply JSON parse failed. Raw:", txt);
   }
 
-  return payload.fallback || "¿En qué te puedo ayudar? 🙂";
+  return fallback || "¿En qué te puedo ayudar? 🙂";
 }
 
 /* =========================
@@ -354,7 +421,6 @@ async function sendWhatsAppText(to, text) {
   }
 
   const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
-
   const payload = {
     messaging_product: "whatsapp",
     to,
@@ -376,25 +442,13 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   Safe payload para OpenAI
-========================= */
-function toSafeOption(p) {
-  return {
-    codigo: p.Codigo,
-    producto: prettyProductName(p.Producto),
-    precio: p.Precio_1,
-    existencia: stockHasExistence(p.SaldoGeneral) ? "HAY" : "NO_HAY",
-    grupo: p.Nombre_Grupo || "",
-  };
-}
-
-/* =========================
    Routes
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
+
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -410,6 +464,7 @@ app.post("/webhook", async (req, res) => {
     const entry = req.body?.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
+
     const messages = value?.messages;
     if (!messages || messages.length === 0) return;
 
@@ -420,166 +475,67 @@ app.post("/webhook", async (req, res) => {
     console.log("✅ Incoming message:", { from, text });
 
     await loadCatalogFromCSV();
-    const sess = sessions.get(from);
+    const sess = sessions.get(from) || { pending: null };
 
-    /* 0) Saludo */
-    if (isGreeting(text)) {
+    // 1) Clasificar intención (DURO)
+    const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
+    const intent = intentObj?.intent || "SEARCH";
+
+    // 2) Manejos rápidos por intención + estado
+    if (intent === "GREETING") {
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "SALUDO_SIMPLE",
-        catalogData: { note: "Solo saludar y preguntar en qué ayudar. No ofrecer líneas ni inventario." },
+        catalogData: { note: "Solo saludar y preguntar en qué ayudar. No ofrecer líneas." },
         fallback: "Hola 👋 ¿En qué te puedo ayudar?",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    /* 1) Atajo global: si pide precio de las opciones actuales (las 3), responderlas */
-    if (sess?.lastOptions?.length && wantsOthers(text)) {
-      const opts = sess.lastOptions.map(toSafeOption);
-      const reply = await generateReplyWithOpenAI({
-        userText: text,
-        mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
-        catalogData: { opciones: opts },
-        fallback: opts
-          .map(
-            (o, i) =>
-              `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${
-                o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-              }`
-          )
-          .join("\n\n"),
-      });
-      await sendWhatsAppText(from, reply);
-      return;
-    }
-
-    /* 2) Si estamos en selección 1/2/3 */
-    if (sess?.pending === "pick" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
-      // ✅ ATAJO: si pide precio de las 3 / todas, responder precios YA
-      if (wantsOthers(text)) {
-        const opts = sess.lastOptions.map(toSafeOption);
-
-        const reply = await generateReplyWithOpenAI({
-          userText: text,
-          mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
-          catalogData: { opciones: opts },
-          fallback: opts
-            .map(
-              (o, i) =>
-                `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${
-                  o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-                }`
-            )
-            .join("\n\n"),
-        });
-
-        await sendWhatsAppText(from, reply);
-        return;
-      }
-
-      const t = String(text || "").trim();
-
-      // 2.1 escoger por número
-      if (isNumericChoice(t)) {
-        const idx = Number(t) - 1;
-        const chosen = sess.lastOptions[idx];
-        if (chosen) {
-          const chosenSafe = toSafeOption(chosen);
-
-          const reply = await generateReplyWithOpenAI({
-            userText: text,
-            mode: "RESPONDER_PRECIO_Y_EXISTENCIA_DE_OPCION_ELEGIDA",
-            catalogData: { opcion_elegida: chosenSafe },
-            fallback: `${chosenSafe.producto}\nPrecio: ${chosenSafe.precio}\n${
-              chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-            }`,
-          });
-
-          sessions.set(from, { ...sess, pending: null });
-          await sendWhatsAppText(from, reply);
-          return;
-        }
-      }
-
-      // 2.2 escoger por código
-      if (looksLikeCode(t)) {
-        const byCode = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(t));
-        if (byCode) {
-          const chosenSafe = toSafeOption(byCode);
-
-          const reply = await generateReplyWithOpenAI({
-            userText: text,
-            mode: "RESPONDER_PRECIO_Y_EXISTENCIA_POR_CODIGO",
-            catalogData: { producto: chosenSafe },
-            fallback: `${chosenSafe.producto}\nPrecio: ${chosenSafe.precio}\n${
-              chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-            }`,
-          });
-
-          sessions.set(from, { ...sess, pending: null });
-          await sendWhatsAppText(from, reply);
-          return;
-        }
-      }
-
-      // 2.3 no entendió
-      const reply = await generateReplyWithOpenAI({
-        userText: text,
-        mode: "PEDIR_QUE_ELIJA_1_2_3_O_CODIGO",
-        catalogData: {
-          opciones: sess.lastOptions.map((p, i) => ({
-            n: i + 1,
-            producto: prettyProductName(p.Producto),
-            codigo: p.Codigo,
-          })),
-        },
-        fallback: "Perfecto 👌 Responde con 1, 2, 3 o el código del producto.",
-      });
-
-      await sendWhatsAppText(from, reply);
-      return;
-    }
-
-    /* 3) Si estamos esperando variante */
-    if (sess?.pending === "variant") {
-      const userVariant = detectVariantFromText(text);
-      if (!userVariant) {
+    // Si estaban pidiendo VARIANT/COLOR, usar la info si OpenAI la detectó
+    if (sess.pending === "variant") {
+      const v = intentObj.variant || detectVariantFromText(text);
+      if (!v) {
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_VARIANTE",
           catalogData: { variantes: sess.variantKeys || [] },
-          fallback: `Perfecto 👌 ¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`,
+          fallback: `¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`,
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      const filtered = (sess.items || []).filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
+      const filtered = (sess.items || []).filter((p) => classifyVariantFromProductName(p.Producto) === v);
       if (filtered.length === 0) {
         const reply = await generateReplyWithOpenAI({
           userText: text,
-          mode: "VARIANTE_NO_ENTENDIDA",
+          mode: "VARIANTE_NO_DISPONIBLE",
           catalogData: { variantes: sess.variantKeys || [] },
-          fallback: `No te entendí esa variante. ¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`,
+          fallback: `No veo esa variante. ¿Cuál necesitas: ${(sess.variantKeys || []).join(", ")}?`,
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      if (hasColorMix(filtered) && !detectColor(text)) {
+      // color si aplica
+      const c = intentObj.color || detectColor(text);
+      if (hasColorMix(filtered) && !c) {
         sessions.set(from, { ...sess, pending: "color", items: filtered });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_COLOR",
           catalogData: { colores: ["BLANCO", "NEGRO"] },
-          fallback: "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?",
+          fallback: "¿Lo necesitas en BLANCO o NEGRO?",
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      const chosenSafe = toSafeOption(filtered[0]);
+      const finalList = c ? filterByColor(filtered, c) : filtered;
+      const chosenSafe = toSafeOption(finalList[0]);
+
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "RESPONDER_PRECIO_Y_EXISTENCIA_FINAL",
@@ -588,32 +544,32 @@ app.post("/webhook", async (req, res) => {
           chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
         }`,
       });
+
       sessions.delete(from);
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    /* 4) Si estamos esperando color */
-    if (sess?.pending === "color") {
-      const color = detectColor(text);
-      if (!color) {
+    if (sess.pending === "color") {
+      const c = intentObj.color || detectColor(text);
+      if (!c) {
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_COLOR",
           catalogData: { colores: ["BLANCO", "NEGRO"] },
-          fallback: "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?",
+          fallback: "¿Lo necesitas en BLANCO o NEGRO?",
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      const chosen = filterByColor(sess.items || [], color);
+      const chosen = filterByColor(sess.items || [], c);
       if (chosen.length === 0) {
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "COLOR_NO_DISPONIBLE",
-          catalogData: { color: color, colores: ["BLANCO", "NEGRO"] },
-          fallback: `En ${color} no lo veo. ¿BLANCO o NEGRO?`,
+          catalogData: { color: c, colores: ["BLANCO", "NEGRO"] },
+          fallback: `En ${c} no lo veo. ¿BLANCO o NEGRO?`,
         });
         await sendWhatsAppText(from, reply);
         return;
@@ -628,27 +584,94 @@ app.post("/webhook", async (req, res) => {
           chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
         }`,
       });
+
       sessions.delete(from);
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    /* 5) Búsqueda normal (con ancla de contexto por grupo para no desviarse) */
-    let matches = searchCatalog(text, 30);
+    // PRICES_ALL_LISTED: si hay lista activa, responder precios de todas las listadas
+    if (intent === "PRICES_ALL_LISTED" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
+      const opts = sess.lastOptions.map(toSafeOption);
 
-    // Si ya teníamos tema anterior, y el mensaje es corto/genérico, filtramos por el mismo grupo
-    if (sess?.lastTopicKey) {
+      const reply = await generateReplyWithOpenAI({
+        userText: text,
+        mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
+        catalogData: { opciones: opts },
+        fallback: opts
+          .map(
+            (o, i) =>
+              `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${
+                o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+              }`
+          )
+          .join("\n\n"),
+      });
+
+      await sendWhatsAppText(from, reply);
+      return;
+    }
+
+    // PICK_OPTION: si hay lista activa, responder opción elegida
+    if (intent === "PICK_OPTION" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
+      const n = intentObj.choice_number;
+      const idx = typeof n === "number" ? n - 1 : -1;
+      const chosen = sess.lastOptions[idx];
+
+      if (chosen) {
+        const chosenSafe = toSafeOption(chosen);
+        const reply = await generateReplyWithOpenAI({
+          userText: text,
+          mode: "RESPONDER_PRECIO_Y_EXISTENCIA_DE_OPCION_ELEGIDA",
+          catalogData: { opcion_elegida: chosenSafe },
+          fallback: `${chosenSafe.producto}\nPrecio: ${chosenSafe.precio}\n${
+            chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+          }`,
+        });
+
+        sessions.set(from, { ...sess, pending: null });
+        await sendWhatsAppText(from, reply);
+        return;
+      }
+      // si OpenAI dijo PICK_OPTION pero no válida, cae abajo a pedir de nuevo
+    }
+
+    // CODE_LOOKUP: buscar por código
+    if (intent === "CODE_LOOKUP" || looksLikeCode(text)) {
+      const code = intentObj.code || String(text).trim();
+      const byCode = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(code));
+      if (byCode) {
+        const safe = toSafeOption(byCode);
+        const reply = await generateReplyWithOpenAI({
+          userText: text,
+          mode: "RESPONDER_PRECIO_Y_EXISTENCIA_POR_CODIGO",
+          catalogData: { producto: safe },
+          fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`,
+        });
+
+        const topicKey = normalizeText(byCode.Nombre_Grupo || "");
+        sessions.set(from, { pending: null, lastOptions: [byCode], lastTopicKey: topicKey });
+        await sendWhatsAppText(from, reply);
+        return;
+      }
+      // si no existe, continúa a búsqueda general
+    }
+
+    // 3) SEARCH (o fallback): buscar por catálogo (con ancla por tema)
+    let matches = searchCatalog(intentObj.search_hint || text, 30);
+
+    // ancla por grupo si el mensaje es genérico y ya había tema
+    if (sess.lastTopicKey) {
       const tnorm = normalizeText(text);
       const isGenericFollowup =
         tnorm.length <= 25 ||
-        tnorm.includes("las cerraduras") ||
-        tnorm.includes("cerraduras") ||
         tnorm.includes("las otras") ||
         tnorm.includes("las demas") ||
         tnorm.includes("las demás") ||
         tnorm.includes("todas") ||
+        tnorm.includes("precio") ||
         tnorm.includes("opciones") ||
-        tnorm.includes("precio");
+        tnorm.includes("de esas");
 
       if (isGenericFollowup) {
         const filtered = matches.filter((p) => normalizeText(p.Nombre_Grupo || "") === sess.lastTopicKey);
@@ -658,24 +681,24 @@ app.post("/webhook", async (req, res) => {
 
     console.log("🔎 Search raw:", text);
     console.log("🔎 Search clean:", cleanQuery(text));
-    console.log("🔎 Matches:", matches.slice(0, 3).map((m) => m.Producto));
+    console.log("🔎 Matches:", matches.slice(0, 5).map((m) => m.Producto));
 
-    // 5.1 no hay match -> OpenAI pregunta (sin inventar)
+    // sin coincidencias
     if (matches.length === 0) {
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "SIN_COINCIDENCIAS_PEDIR_ACLARACION",
         catalogData: { note: "No hay coincidencias. Pedir código o nombre exacto." },
-        fallback: "No lo encontré en el catálogo. ¿Me compartes el nombre exacto o el código, por favor?",
+        fallback: "No lo encontré en el catálogo. ¿Me compartes el nombre exacto o el código?",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // 5.2 Variantes SOLO si es celulares
+    // Variantes SOLO si parece celulares
     const allowVariants = isCellphoneContext(matches, text);
     if (allowVariants) {
-      const userVariant = detectVariantFromText(text);
+      const userVariant = intentObj.variant || detectVariantFromText(text);
       let refined = matches;
 
       if (userVariant) {
@@ -685,31 +708,38 @@ app.post("/webhook", async (req, res) => {
 
       const variantOptions = computeVariantOptions(refined);
       if (!userVariant && variantOptions) {
-        sessions.set(from, { pending: "variant", items: refined, variantKeys: variantOptions.keys });
+        sessions.set(from, { pending: "variant", items: refined, variantKeys: variantOptions.keys, lastTopicKey: sess.lastTopicKey || null });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_VARIANTE",
           catalogData: { variantes: variantOptions.keys },
-          fallback: `Perfecto 👌 ¿Cuál necesitas: ${variantOptions.keys.join(", ")}?`,
+          fallback: `¿Cuál necesitas: ${variantOptions.keys.join(", ")}?`,
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      if (hasColorMix(refined) && !detectColor(text)) {
-        sessions.set(from, { pending: "color", items: refined });
+      // color si aplica
+      const c = intentObj.color || detectColor(text);
+      if (hasColorMix(refined) && !c) {
+        sessions.set(from, { pending: "color", items: refined, lastTopicKey: sess.lastTopicKey || null });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_COLOR",
           catalogData: { colores: ["BLANCO", "NEGRO"] },
-          fallback: "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?",
+          fallback: "¿Lo necesitas en BLANCO o NEGRO?",
         });
         await sendWhatsAppText(from, reply);
         return;
       }
+
+      if (c) {
+        const chosen = filterByColor(refined, c);
+        if (chosen.length > 0) refined = chosen;
+      }
     }
 
-    // 5.3 Si hay un match claro (1) -> responder precio/existencia
+    // match único => responder
     if (matches.length === 1) {
       const p = matches[0];
       const safe = toSafeOption(p);
@@ -727,7 +757,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 5.4 Mostrar 3 opciones y guardar contexto
+    // múltiples => listar 3 y guardar estado pick
     const lastOptions = matches.slice(0, 3);
     const topicKey = normalizeText(lastOptions[0]?.Nombre_Grupo || "");
 
@@ -746,7 +776,7 @@ app.post("/webhook", async (req, res) => {
       fallback:
         `Encontré estas opciones:\n` +
         lastOptions.map((p, i) => `${i + 1}) ${prettyProductName(p.Producto)}`).join("\n") +
-        `\n\n¿Cuál te interesa? (1, 2, 3 o el código)`,
+        `\n\n¿Cuál te interesa? (1, 2, 3 o el código)\nSi quieres el precio de todas, escribe: "precio de cada una"`,
     });
 
     await sendWhatsAppText(from, reply);
