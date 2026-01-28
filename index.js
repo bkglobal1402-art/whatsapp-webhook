@@ -21,7 +21,19 @@ function normalizeText(s = "") {
   return String(s)
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\u0300-\u036f]/g, "") // quita tildes
+    .replace(/[^a-z0-9]+/g, " ") // limpia símbolos
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Quitar palabras “de relleno” que dañan la búsqueda
+function cleanQuery(raw = "") {
+  return normalizeText(raw)
+    .replace(
+      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q)\b/g,
+      ""
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -36,6 +48,28 @@ let catalogCache = {
 };
 
 const FIVE_MIN = 5 * 60 * 1000;
+
+function pick(r, ...names) {
+  // Permite leer columnas aunque el encabezado cambie (mayúsculas, tildes, espacios)
+  const keys = Object.keys(r || {});
+  const normKey = (k) =>
+    String(k)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+
+  const map = new Map(keys.map((k) => [normKey(k), k]));
+
+  for (const n of names) {
+    const realKey = map.get(normKey(n));
+    if (realKey && r[realKey] != null && String(r[realKey]).trim() !== "") {
+      return String(r[realKey]).trim();
+    }
+  }
+  return "";
+}
 
 async function loadCatalogFromCSV() {
   const url = process.env.CATALOG_CSV_URL;
@@ -60,22 +94,58 @@ async function loadCatalogFromCSV() {
     skip_empty_lines: true,
   });
 
-  // Columnas esperadas:
-  // Codigo | Producto | Precio_1 | SaldoGeneral | Nombre_Grupo
+  // DEBUG: para ver encabezados reales del CSV en Railway logs
+  console.log("🧾 CSV headers:", Object.keys(records[0] || {}));
+
+  // Mapeo tolerante de columnas (por si cambian los nombres)
   const rows = records
-    .filter((r) => r.Codigo || r.Producto)
-    .map((r) => ({
-      Codigo: String(r.Codigo || "").trim(),
-      Producto: String(r.Producto || "").trim(),
-      Precio_1: String(r.Precio_1 || "").trim(),
-      SaldoGeneral: String(r.SaldoGeneral || "").trim(),
-      Nombre_Grupo: String(r.Nombre_Grupo || "").trim(),
-      _q: normalizeText(`${r.Codigo} ${r.Producto} ${r.Nombre_Grupo}`),
-    }));
+    .map((r) => {
+      const Codigo = pick(r, "Codigo", "CODIGO", "Código", "code", "sku", "referencia");
+      const Producto = pick(
+        r,
+        "Producto",
+        "PRODUCTO",
+        "Nombre_Producto",
+        "Nombre",
+        "Descripcion",
+        "Descripción",
+        "description",
+        "name"
+      );
+      const Precio_1 = pick(r, "Precio_1", "Precio1", "Precio 1", "Precio", "price");
+      const SaldoGeneral = pick(
+        r,
+        "SaldoGeneral",
+        "Saldo General",
+        "Stock",
+        "Existencias",
+        "Inventario"
+      );
+      const Nombre_Grupo = pick(
+        r,
+        "Nombre_Grupo",
+        "Nombre Grupo",
+        "Grupo",
+        "Categoria",
+        "Categoría"
+      );
+
+      if (!Codigo && !Producto) return null;
+
+      return {
+        Codigo,
+        Producto,
+        Precio_1,
+        SaldoGeneral,
+        Nombre_Grupo,
+        _q: normalizeText(`${Codigo} ${Producto} ${Nombre_Grupo}`),
+      };
+    })
+    .filter(Boolean);
 
   const fuse = new Fuse(rows, {
     includeScore: true,
-    threshold: 0.35,
+    threshold: 0.45, // más tolerante
     keys: ["Codigo", "Producto", "_q", "Nombre_Grupo"],
   });
 
@@ -93,13 +163,17 @@ function searchCatalog(query, limit = 6) {
   if (!catalogCache.fuse) return [];
 
   const raw = String(query || "").trim();
-  const q = normalizeText(raw);
+  const q = cleanQuery(raw);
 
-  // Match exacto por código
+  // Match exacto por código (normalizado)
   const exact = catalogCache.rows.find(
-    (r) => r.Codigo && r.Codigo === raw
+    (r) =>
+      normalizeText(r.Codigo) &&
+      normalizeText(r.Codigo) === normalizeText(raw)
   );
   if (exact) return [exact];
+
+  if (!q) return [];
 
   const results = catalogCache.fuse.search(q).slice(0, limit);
   return results.map((r) => r.item);
@@ -246,6 +320,11 @@ app.post("/webhook", async (req, res) => {
       const matches = searchCatalog(text, 6);
       catalogContext = formatItemsForPrompt(matches);
       catalogOk = true;
+
+      // DEBUG útil: ver query limpia y 1 resultado
+      console.log("🔎 Search raw:", text);
+      console.log("🔎 Search clean:", cleanQuery(text));
+      console.log("🔎 Matches:", matches.slice(0, 2));
     } catch (e) {
       console.error("⚠️ Catalog error:", e.message);
     }
@@ -269,6 +348,4 @@ app.post("/webhook", async (req, res) => {
    Start
 ========================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`✅ Server running on port ${PORT}`)
-);
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
