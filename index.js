@@ -348,4 +348,8 @@ app.post("/webhook", async (req, res) => {
    Start
 ========================= */
 const PORT = process.env.PORT || 3000;
+process.on("SIGTERM", () => {
+  console.log("👋 SIGTERM recibido, cerrando servidor...");
+  process.exit(0);
+});
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
