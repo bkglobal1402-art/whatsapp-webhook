@@ -80,14 +80,23 @@ function filterByColor(items, color) {
   return items.filter((p) => normalizeText(p.Producto).includes(c));
 }
 
+function isNumericChoice(text) {
+  const t = String(text || "").trim();
+  return t === "1" || t === "2" || t === "3";
+}
+
+function looksLikeCode(text) {
+  // si escribe un código de producto (ej 103924)
+  const t = String(text || "").trim();
+  return /^\d{4,}$/.test(t);
+}
+
 /* =========================
    Variant engine (general)
-   - Pregunta SOLO si hay más de una variante real entre los resultados.
-   - Variantes soportadas: pro max, pro, mini, plus, max, ultra, lite, se
 ========================= */
 const VARIANT_PATTERNS = [
   { key: "PRO MAX", patterns: ["pro max", "promax"] },
-  { key: "PRO", patterns: [" pro "] }, // con espacios para no confundir
+  { key: "PRO", patterns: [" pro "] },
   { key: "MINI", patterns: [" mini "] },
   { key: "PLUS", patterns: [" plus "] },
   { key: "MAX", patterns: [" max "] },
@@ -96,7 +105,6 @@ const VARIANT_PATTERNS = [
   { key: "SE", patterns: [" se "] },
 ];
 
-// detecta si el usuario YA dijo una variante en el mensaje
 function detectVariantFromText(text) {
   const t = ` ${normalizeText(text)} `;
   for (const v of VARIANT_PATTERNS) {
@@ -108,7 +116,6 @@ function detectVariantFromText(text) {
   return null;
 }
 
-// clasifica un producto en una variante (si aplica). Si no aplica, null.
 function classifyVariantFromProductName(productName) {
   const t = ` ${normalizeText(productName)} `;
   for (const v of VARIANT_PATTERNS) {
@@ -120,7 +127,6 @@ function classifyVariantFromProductName(productName) {
   return null;
 }
 
-// construye opciones reales de variante según los matches
 function computeVariantOptions(items) {
   const map = new Map(); // key -> items[]
   for (const p of items) {
@@ -129,12 +135,9 @@ function computeVariantOptions(items) {
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(p);
   }
-
-  // Solo tiene sentido preguntar si hay 2+ variantes distintas
   const keys = Array.from(map.keys());
   if (keys.length < 2) return null;
 
-  // Ordenar por el orden de VARIANT_PATTERNS
   const order = new Map(VARIANT_PATTERNS.map((v, i) => [v.key, i]));
   keys.sort((a, b) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
 
@@ -147,9 +150,10 @@ function computeVariantOptions(items) {
 const sessions = new Map();
 /*
 sessions.get(from) = {
-  pending: "variant" | "color",
-  items: [...],          // items actuales filtrados
-  variantKeys?: [...],   // variantes disponibles para mostrar
+  pending: "variant" | "color" | "pick",
+  items: [...],        // items actuales filtrados
+  variantKeys?: [...],
+  lastOptions?: [...], // últimos 1..3 mostrados
 }
 */
 
@@ -239,7 +243,7 @@ async function loadCatalogFromCSV() {
   return catalogCache;
 }
 
-function searchCatalog(query, limit = 20) {
+function searchCatalog(query, limit = 25) {
   if (!catalogCache.fuse) return [];
 
   const raw = String(query || "").trim();
@@ -353,9 +357,57 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Si hay sesión pendiente (VARIANTE / COLOR)
+    // Asegurar catálogo cargado (para cualquier flujo)
+    await loadCatalogFromCSV();
+
+    // Si hay sesión pendiente (PICK / VARIANTE / COLOR)
     const sess = sessions.get(from);
 
+    // 1) Si el bot mostró opciones 1..3 y el cliente responde "1/2/3" o un código
+    if (sess?.pending === "pick" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
+      const t = String(text || "").trim();
+
+      if (isNumericChoice(t)) {
+        const idx = Number(t) - 1;
+        const chosen = sess.lastOptions[idx];
+        if (chosen) {
+          // Si después del “pick” hay color mezclado, preguntar color
+          if (hasColorMix([chosen]) === false) {
+            await sendWhatsAppText(from, formatOneProduct(chosen));
+            sessions.delete(from);
+            return;
+          }
+          // (normalmente un solo ítem no tiene mezcla de color, pero lo dejamos por seguridad)
+          await sendWhatsAppText(from, formatOneProduct(chosen));
+          sessions.delete(from);
+          return;
+        }
+      }
+
+      if (looksLikeCode(t)) {
+        const byCode = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(t));
+        if (byCode) {
+          await sendWhatsAppText(from, formatOneProduct(byCode));
+          sessions.delete(from);
+          return;
+        }
+      }
+
+      // Si escribió texto (ej “me refería a la cerradura securepro 100”), intentamos match dentro de las opciones mostradas
+      const nt = normalizeText(t);
+      const best = sess.lastOptions.find((p) => normalizeText(p.Producto).includes(nt) || nt.includes(normalizeText(p.Producto)));
+      if (best) {
+        await sendWhatsAppText(from, formatOneProduct(best));
+        sessions.delete(from);
+        return;
+      }
+
+      // Si no entendimos, repetir instrucción
+      await sendWhatsAppText(from, "Perfecto 👌 Responde con 1, 2, 3 o el código del producto.");
+      return;
+    }
+
+    // 2) Variante
     if (sess?.pending === "variant") {
       const userVariant = detectVariantFromText(text);
       if (!userVariant) {
@@ -364,16 +416,13 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      // filtrar por variante
       const filtered = (sess.items || []).filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
-
       if (filtered.length === 0) {
         const list = (sess.variantKeys || []).join(", ");
         await sendWhatsAppText(from, `No te entendí esa variante. ¿Cuál necesitas: ${list}?`);
         return;
       }
 
-      // después de variante: si hay color, preguntar
       if (hasColorMix(filtered) && !detectColor(text)) {
         sessions.set(from, { pending: "color", items: filtered });
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
@@ -385,24 +434,26 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // 3) Color
     if (sess?.pending === "color") {
       const color = detectColor(text);
       if (!color) {
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
+
       const chosen = filterByColor(sess.items || [], color);
       if (chosen.length === 0) {
         await sendWhatsAppText(from, `En ${color} no lo veo disponible. ¿Lo quieres en BLANCO o NEGRO?`);
         return;
       }
+
       await sendWhatsAppText(from, formatOneProduct(chosen[0]));
       sessions.delete(from);
       return;
     }
 
-    // Cargar catálogo y buscar
-    await loadCatalogFromCSV();
+    // Buscar en catálogo
     const matches = searchCatalog(text, 25);
 
     console.log("🔎 Search raw:", text);
@@ -416,18 +467,16 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Si el usuario pide precio/disponibilidad, aplicamos “inteligencia de variantes”
+    // Si pide precio/disponibilidad: aplicar reglas de variante/color y responder
     if (asksPriceOrAvailability(text)) {
       const userVariant = detectVariantFromText(text);
 
-      // Si ya dijo variante, filtrar por ella
       let refined = matches;
       if (userVariant) {
         const filtered = matches.filter((p) => classifyVariantFromProductName(p.Producto) === userVariant);
         if (filtered.length > 0) refined = filtered;
       }
 
-      // 1) Si hay mezcla de variantes y el usuario NO especificó -> preguntar variante (con lista real)
       const variantOptions = computeVariantOptions(refined);
       if (!userVariant && variantOptions) {
         sessions.set(from, {
@@ -439,21 +488,26 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      // 2) Si hay mezcla de colores -> preguntar color
       if (hasColorMix(refined) && !detectColor(text)) {
         sessions.set(from, { pending: "color", items: refined });
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
 
-      // 3) Responder con el mejor match (sin cantidades)
       await sendWhatsAppText(from, formatOneProduct(refined[0]));
       return;
     }
 
-    // Si NO pidió precio: mostrar 2–3 opciones y preguntar cuál
-    const options = matches.slice(0, 3).map((p, i) => `${i + 1}) ${p.Producto}`).join("\n");
-    await sendWhatsAppText(from, `Encontré estas opciones:\n${options}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`);
+    // Si NO pidió precio: mostrar 2–3 opciones y guardar en sesión para que "1" funcione
+    const lastOptions = matches.slice(0, 3);
+    const optionsText = lastOptions.map((p, i) => `${i + 1}) ${p.Producto}`).join("\n");
+
+    sessions.set(from, { pending: "pick", lastOptions });
+
+    await sendWhatsAppText(
+      from,
+      `Encontré estas opciones:\n${optionsText}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`
+    );
   } catch (err) {
     console.error("❌ Webhook error:", err);
   }
