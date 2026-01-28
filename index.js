@@ -26,7 +26,7 @@ function normalizeText(s = "") {
 function cleanQuery(raw = "") {
   return normalizeText(raw)
     .replace(
-      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion)\b/g,
+      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto)\b/g,
       ""
     )
     .replace(/\s+/g, " ")
@@ -35,7 +35,6 @@ function cleanQuery(raw = "") {
 
 function isGreeting(text) {
   const t = normalizeText(text);
-  // si el mensaje empieza con saludo
   return ["hola", "buenas", "hey", "buenos dias", "buenas tardes", "buenas noches"].some(
     (w) => t === w || t.startsWith(w + " ")
   );
@@ -55,21 +54,6 @@ function detectColor(text) {
   return null;
 }
 
-function isDisplayIntent(text) {
-  const t = normalizeText(text);
-  return ["display", "pantalla", "lcd", "tactil", "touch"].some((w) => t.includes(w));
-}
-
-function mentionsIphone7(text) {
-  const t = normalizeText(text);
-  return t.includes("iphone 7") || t.includes("iphone7") || t.includes("ip 7");
-}
-
-function mentionsIphone7Plus(text) {
-  const t = normalizeText(text);
-  return t.includes("iphone 7 plus") || t.includes("iphone7 plus") || t.includes("7 plus");
-}
-
 function stockHasExistence(saldoGeneral) {
   const raw = String(saldoGeneral || "").replace(/\./g, "").replace(",", ".").trim();
   const n = Number(raw);
@@ -81,9 +65,32 @@ function availabilityText(saldoGeneral) {
   return stockHasExistence(saldoGeneral) ? "✅ Hay existencia" : "❌ Sin existencia";
 }
 
-function productHasAny(p, words) {
-  const t = normalizeText(p.Producto);
-  return words.some((w) => t.includes(w));
+function formatOneProduct(p) {
+  return `${p.Producto}\nPrecio: ${p.Precio_1}\n${availabilityText(p.SaldoGeneral)}`;
+}
+
+/* =========================
+   Variant detection (general)
+========================= */
+// Regla de variante iPhone: si en resultados hay "7 plus" y "iphone 7" (sin plus), preguntamos.
+function hasIphone7VariantMix(items) {
+  const plus = items.some((p) => normalizeText(p.Producto).includes("7 plus"));
+  const normal7 = items.some((p) => normalizeText(p.Producto).includes("iphone 7") && !normalizeText(p.Producto).includes("7 plus"));
+  return plus && normal7;
+}
+
+function pickIphone7Variant(items, answerText) {
+  const t = normalizeText(answerText);
+  const wantsPlus = t.includes("plus");
+  if (wantsPlus) return items.filter((p) => normalizeText(p.Producto).includes("7 plus"));
+  // si responde "7" o "normal"
+  return items.filter((p) => normalizeText(p.Producto).includes("iphone 7") && !normalizeText(p.Producto).includes("7 plus"));
+}
+
+function hasColorMix(items) {
+  const hasWhite = items.some((p) => normalizeText(p.Producto).includes("blanco"));
+  const hasBlack = items.some((p) => normalizeText(p.Producto).includes("negro"));
+  return hasWhite && hasBlack;
 }
 
 function filterByColor(items, color) {
@@ -97,8 +104,7 @@ function filterByColor(items, color) {
 const sessions = new Map();
 /*
 sessions.get(from) = {
-  pending: "iphone_variant" | "color",
-  intent: "display_iphone7",
+  pending: "iphone_7_variant" | "color",
   items: [...]
 }
 */
@@ -143,8 +149,8 @@ async function loadCatalogFromCSV() {
   if (!resp.ok) throw new Error(`Failed to download CSV: ${resp.status}`);
 
   const csvText = await resp.text();
-
   const records = parse(csvText, { columns: true, skip_empty_lines: true });
+
   console.log("🧾 CSV headers:", Object.keys(records[0] || {}));
 
   const rows = records
@@ -193,17 +199,7 @@ function searchCatalog(query, limit = 15) {
 
   if (!q) return [];
 
-  let items = catalogCache.fuse.search(q).map((r) => r.item);
-
-  // Si piden display, filtra a solo display/pantalla (si hay)
-  if (isDisplayIntent(raw)) {
-    const filtered = items.filter((p) =>
-      productHasAny(p, ["display", "pantalla", "lcd", "tactil", "touch"])
-    );
-    if (filtered.length > 0) items = filtered;
-  }
-
-  return items.slice(0, limit);
+  return catalogCache.fuse.search(q).slice(0, limit).map((r) => r.item);
 }
 
 /* =========================
@@ -241,7 +237,7 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   OpenAI (solo para conversación general)
+   OpenAI (solo para conversación cuando NO hay match)
 ========================= */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -265,13 +261,6 @@ Si falta información del cliente, haz 1 pregunta para aclarar.
   });
 
   return r.choices?.[0]?.message?.content?.trim() || "¿En qué te puedo ayudar? 🙂";
-}
-
-/* =========================
-   Formatting (sin cantidades)
-========================= */
-function formatOneProduct(p) {
-  return `${p.Producto}\nPrecio: ${p.Precio_1}\n${availabilityText(p.SaldoGeneral)}`;
 }
 
 /* =========================
@@ -305,146 +294,90 @@ app.post("/webhook", async (req, res) => {
 
     console.log("✅ Incoming message:", { from, text });
 
-    // 1) Saludo simple (NO listar líneas)
+    // Saludo opción 1
     if (isGreeting(text)) {
       await sendWhatsAppText(from, "Hola 👋 ¿En qué te puedo ayudar?");
       return;
     }
 
-    // 2) Si estamos esperando respuesta del cliente (7 vs 7 Plus / color)
+    // Si estamos en aclaración (7 vs 7 Plus)
     const sess = sessions.get(from);
-    if (sess?.pending === "iphone_variant") {
-      const t = normalizeText(text);
-
-      const saysPlus = t.includes("plus");
-      const saysSeven = t.includes("7") || t.includes("iphone 7") || t.includes("iphone7");
-
-      if (!saysSeven) {
-        await sendWhatsAppText(from, "¿Es iPhone 7 normal o iPhone 7 Plus?");
-        return;
-      }
-
-      const itemsForVariant = saysPlus
-        ? (sess.items || []).filter((p) => normalizeText(p.Producto).includes("7 plus"))
-        : (sess.items || []).filter(
-            (p) => normalizeText(p.Producto).includes("iphone 7") && !normalizeText(p.Producto).includes("7 plus")
-          );
-
-      if (itemsForVariant.length === 0) {
+    if (sess?.pending === "iphone_7_variant") {
+      const refined = pickIphone7Variant(sess.items || [], text);
+      if (refined.length === 0) {
         sessions.delete(from);
-        await sendWhatsAppText(from, "Listo. No lo veo disponible para ese modelo. ¿Me confirmas el modelo exacto y si lo necesitas con táctil?");
+        await sendWhatsAppText(from, "Perfecto. ¿Me confirmas el modelo exacto nuevamente para ayudarte?");
         return;
       }
 
-      sessions.set(from, { pending: "color", intent: sess.intent, items: itemsForVariant });
-      await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
+      // luego color si aplica
+      if (hasColorMix(refined) && !detectColor(text)) {
+        sessions.set(from, { pending: "color", items: refined });
+        await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
+        return;
+      }
+
+      // si no hay mezcla de color, responder
+      await sendWhatsAppText(from, formatOneProduct(refined[0]));
+      sessions.delete(from);
       return;
     }
 
+    // Si estamos en aclaración de color
     if (sess?.pending === "color") {
       const color = detectColor(text);
       if (!color) {
         await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
         return;
       }
-
       const chosen = filterByColor(sess.items || [], color);
       if (chosen.length === 0) {
         await sendWhatsAppText(from, `En ${color} no lo veo disponible. ¿Lo quieres en BLANCO o NEGRO?`);
         return;
       }
-
       await sendWhatsAppText(from, formatOneProduct(chosen[0]));
       sessions.delete(from);
       return;
     }
 
-    // 3) Cargar catálogo
+    // Cargar catálogo y buscar
     await loadCatalogFromCSV();
-
-    // 4) Flujo especial: Display iPhone 7 (preguntar 7 vs 7 Plus -> color -> precio + existencia)
-    if (isDisplayIntent(text) && (mentionsIphone7(text) || mentionsIphone7Plus(text))) {
-      const matches = searchCatalog(text, 40);
-
-      // solo displays
-      const displayItems = matches.filter((p) =>
-        productHasAny(p, ["display", "pantalla", "lcd", "tactil", "touch"])
-      );
-
-      if (displayItems.length === 0) {
-        await sendWhatsAppText(from, "No lo encuentro con ese nombre. ¿Me confirmas el modelo exacto y si lo necesitas completo con táctil?");
-        return;
-      }
-
-      const color = detectColor(text);
-      const alreadyPlus = mentionsIphone7Plus(text);
-
-      // Si NO aclara plus, preguntar primero
-      if (!alreadyPlus) {
-        sessions.set(from, { pending: "iphone_variant", intent: "display_iphone7", items: displayItems });
-        await sendWhatsAppText(from, "Perfecto 👌 ¿Es iPhone 7 normal o iPhone 7 Plus?");
-        return;
-      }
-
-      // Si sí aclara Plus, ir a color
-      let itemsForVariant = displayItems.filter((p) => normalizeText(p.Producto).includes("7 plus"));
-      if (itemsForVariant.length === 0) {
-        await sendWhatsAppText(from, "Para iPhone 7 Plus no lo veo disponible. ¿Lo necesitas para iPhone 7 normal?");
-        return;
-      }
-
-      if (!color) {
-        sessions.set(from, { pending: "color", intent: "display_iphone7plus", items: itemsForVariant });
-        await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
-        return;
-      }
-
-      const chosen = filterByColor(itemsForVariant, color);
-      if (chosen.length === 0) {
-        sessions.set(from, { pending: "color", intent: "display_iphone7plus", items: itemsForVariant });
-        await sendWhatsAppText(from, `En ${color} no lo veo disponible. ¿Lo quieres en BLANCO o NEGRO?`);
-        return;
-      }
-
-      await sendWhatsAppText(from, formatOneProduct(chosen[0]));
-      return;
-    }
-
-    // 5) Flujo general para CUALQUIER producto del catálogo
-    const matches = searchCatalog(text, 10);
+    const matches = searchCatalog(text, 20);
 
     console.log("🔎 Search raw:", text);
     console.log("🔎 Search clean:", cleanQuery(text));
     console.log("🔎 Matches:", matches.slice(0, 3));
 
-    // Si pide precio/disponibilidad y tenemos match, responder directo (sin cantidades)
-    if (asksPriceOrAvailability(text) && matches.length > 0) {
-      // Si hay varias opciones, haz 1 pregunta en vez de listar líneas comerciales
-      // Ej: si detecta BLANCO/NEGRO en los resultados, pregunta color.
-      const color = detectColor(text);
-      const hasWhite = matches.some((p) => normalizeText(p.Producto).includes("blanco"));
-      const hasBlack = matches.some((p) => normalizeText(p.Producto).includes("negro"));
-
-      if (!color && (hasWhite || hasBlack) && matches.length > 1) {
-        sessions.set(from, { pending: "color", intent: "generic_color", items: matches });
-        await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
-        return;
-      }
-
-      // Si no hay necesidad de preguntar, responde con la mejor opción
-      await sendWhatsAppText(from, formatOneProduct(matches[0]));
-      return;
-    }
-
-    // Si NO hay matches, conversación normal (pregunta 1 cosa)
+    // Si no hay match: conversación natural (pregunta 1 cosa)
     if (matches.length === 0) {
       const reply = await askOpenAI(text);
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Si hay matches pero el cliente no pidió precio todavía:
-    // muestra 2-3 opciones y pregunta cuál
+    // Si el usuario pide precio/disponibilidad:
+    if (asksPriceOrAvailability(text)) {
+      // 1) Si hay mezcla iPhone 7 vs 7 Plus, preguntar primero
+      if (hasIphone7VariantMix(matches) && !normalizeText(text).includes("plus")) {
+        sessions.set(from, { pending: "iphone_7_variant", items: matches });
+        await sendWhatsAppText(from, "Perfecto 👌 ¿Es iPhone 7 normal o iPhone 7 Plus?");
+        return;
+      }
+
+      // 2) Si hay mezcla de color, preguntar color
+      if (hasColorMix(matches) && !detectColor(text)) {
+        sessions.set(from, { pending: "color", items: matches });
+        await sendWhatsAppText(from, "Perfecto 👌 ¿Lo necesitas en BLANCO o NEGRO?");
+        return;
+      }
+
+      // 3) Responder directo con la mejor opción (sin cantidades)
+      await sendWhatsAppText(from, formatOneProduct(matches[0]));
+      return;
+    }
+
+    // Si no pidió precio, pero hay matches:
+    // Mostrar 2–3 opciones y preguntar cuál (sin vender “líneas”)
     const options = matches.slice(0, 3).map((p, i) => `${i + 1}) ${p.Producto}`).join("\n");
     await sendWhatsAppText(from, `Encontré estas opciones:\n${options}\n\n¿Cuál te interesa? (1, 2, 3 o el código)`);
   } catch (err) {
