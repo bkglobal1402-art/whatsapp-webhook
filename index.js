@@ -54,10 +54,6 @@ function stockHasExistence(saldoGeneral) {
   return n > 0;
 }
 
-function availabilityText(saldoGeneral) {
-  return stockHasExistence(saldoGeneral) ? "✅ Hay existencia" : "❌ Sin existencia";
-}
-
 function isNumericChoice(text) {
   const t = String(text || "").trim();
   return t === "1" || t === "2" || t === "3";
@@ -77,11 +73,16 @@ function wantsOthers(text) {
     t.includes("las restantes") ||
     t.includes("todas") ||
     t.includes("toda") ||
+    t.includes("las 3") ||
+    t.includes("las tres") ||
+    t.includes("3 opciones") ||
+    t.includes("las opciones") ||
     t.includes("precio de las otras") ||
-    t.includes("precio de las demas") ||
-    t.includes("precio de las demás") ||
     t.includes("precio de todas") ||
-    t.includes("precio de toda")
+    t.includes("precio de toda") ||
+    t.includes("precio de las 3") ||
+    t.includes("precio de las tres") ||
+    t.includes("precio de las opciones")
   );
 }
 
@@ -93,7 +94,6 @@ function prettyProductName(name = "") {
   const n = normalizeText(s);
   if (n.includes("display") && n.includes("iphone")) {
     s = s.replace(/t[aá]ctil/gi, "").replace(/\s+/g, " ").trim();
-    // También quitar doble espacios por si quedó raro
     s = s.replace(/\s{2,}/g, " ").trim();
   }
   return s;
@@ -293,9 +293,6 @@ function searchCatalog(query, limit = 30) {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function generateReplyWithOpenAI(payload) {
-  // payload = { userText, mode, options[], item?, items?, question? ... }
-  // OpenAI debe devolver JSON: { reply: "..." }
-
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const system = `
@@ -341,7 +338,6 @@ ${JSON.stringify(payload.catalogData, null, 2)}
     console.error("⚠️ OpenAI JSON parse failed. Raw:", txt);
   }
 
-  // Fallback seguro (determinístico)
   return payload.fallback || "¿En qué te puedo ayudar? 🙂";
 }
 
@@ -380,7 +376,7 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   Builder de "catalogData" seguro para OpenAI
+   Safe payload para OpenAI
 ========================= */
 function toSafeOption(p) {
   return {
@@ -438,7 +434,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    /* 1) Si el usuario pide "las otras / todas" y tenemos lastOptions */
+    /* 1) Atajo global: si pide precio de las opciones actuales (las 3), responderlas */
     if (sess?.lastOptions?.length && wantsOthers(text)) {
       const opts = sess.lastOptions.map(toSafeOption);
       const reply = await generateReplyWithOpenAI({
@@ -446,7 +442,12 @@ app.post("/webhook", async (req, res) => {
         mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
         catalogData: { opciones: opts },
         fallback: opts
-          .map((o, i) => `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`)
+          .map(
+            (o, i) =>
+              `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${
+                o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+              }`
+          )
           .join("\n\n"),
       });
       await sendWhatsAppText(from, reply);
@@ -455,6 +456,28 @@ app.post("/webhook", async (req, res) => {
 
     /* 2) Si estamos en selección 1/2/3 */
     if (sess?.pending === "pick" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
+      // ✅ ATAJO: si pide precio de las 3 / todas, responder precios YA
+      if (wantsOthers(text)) {
+        const opts = sess.lastOptions.map(toSafeOption);
+
+        const reply = await generateReplyWithOpenAI({
+          userText: text,
+          mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
+          catalogData: { opciones: opts },
+          fallback: opts
+            .map(
+              (o, i) =>
+                `${i + 1}) ${o.producto}\nPrecio: ${o.precio}\n${
+                  o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+                }`
+            )
+            .join("\n\n"),
+        });
+
+        await sendWhatsAppText(from, reply);
+        return;
+      }
+
       const t = String(text || "").trim();
 
       // 2.1 escoger por número
@@ -473,7 +496,6 @@ app.post("/webhook", async (req, res) => {
             }`,
           });
 
-          // conservar contexto para preguntas "las otras"
           sessions.set(from, { ...sess, pending: null });
           await sendWhatsAppText(from, reply);
           return;
@@ -506,10 +528,15 @@ app.post("/webhook", async (req, res) => {
         userText: text,
         mode: "PEDIR_QUE_ELIJA_1_2_3_O_CODIGO",
         catalogData: {
-          opciones: sess.lastOptions.map((p, i) => ({ n: i + 1, producto: prettyProductName(p.Producto), codigo: p.Codigo })),
+          opciones: sess.lastOptions.map((p, i) => ({
+            n: i + 1,
+            producto: prettyProductName(p.Producto),
+            codigo: p.Codigo,
+          })),
         },
         fallback: "Perfecto 👌 Responde con 1, 2, 3 o el código del producto.",
       });
+
       await sendWhatsAppText(from, reply);
       return;
     }
@@ -552,7 +579,6 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      // responder primer item filtrado
       const chosenSafe = toSafeOption(filtered[0]);
       const reply = await generateReplyWithOpenAI({
         userText: text,
@@ -620,7 +646,9 @@ app.post("/webhook", async (req, res) => {
         tnorm.includes("las otras") ||
         tnorm.includes("las demas") ||
         tnorm.includes("las demás") ||
-        tnorm.includes("todas");
+        tnorm.includes("todas") ||
+        tnorm.includes("opciones") ||
+        tnorm.includes("precio");
 
       if (isGenericFollowup) {
         const filtered = matches.filter((p) => normalizeText(p.Nombre_Grupo || "") === sess.lastTopicKey);
@@ -632,7 +660,7 @@ app.post("/webhook", async (req, res) => {
     console.log("🔎 Search clean:", cleanQuery(text));
     console.log("🔎 Matches:", matches.slice(0, 3).map((m) => m.Producto));
 
-    // 5.1 no hay match -> OpenAI hace pregunta (sin inventar)
+    // 5.1 no hay match -> OpenAI pregunta (sin inventar)
     if (matches.length === 0) {
       const reply = await generateReplyWithOpenAI({
         userText: text,
@@ -699,7 +727,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 5.4 Mostrar 3 opciones y guardar contexto para seguir el hilo
+    // 5.4 Mostrar 3 opciones y guardar contexto
     const lastOptions = matches.slice(0, 3);
     const topicKey = normalizeText(lastOptions[0]?.Nombre_Grupo || "");
 
@@ -713,7 +741,6 @@ app.post("/webhook", async (req, res) => {
           n: i + 1,
           producto: prettyProductName(p.Producto),
           codigo: p.Codigo,
-          // Nota: NO damos precio aquí, solo se da cuando el cliente elige una opción
         })),
       },
       fallback:
