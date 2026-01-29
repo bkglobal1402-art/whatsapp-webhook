@@ -62,8 +62,7 @@ function moneyCOP(n) {
 function shouldShowPrice(listPrice) {
   const n = Number(listPrice || 0);
   if (!isFinite(n)) return false;
-  // evita $1 / $0 placeholder
-  return n > 10;
+  return n > 10; // evita $0 / $1 placeholder
 }
 
 function safeJsonStringify(obj) {
@@ -105,16 +104,11 @@ function shortToolResult(result) {
 }
 
 function cleanWhatsAppText(text) {
-  // quita markdown fuerte y repetidos sencillos
   let t = String(text || "");
-
-  // elimina **bold**
-  t = t.replace(/\*\*/g, "");
-
-  // normaliza saltos
+  t = t.replace(/\*\*/g, ""); // quita markdown fuerte
   t = t.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 
-  // quita duplicación exacta de líneas consecutivas
+  // elimina duplicación exacta de líneas consecutivas
   const lines = t.split("\n");
   const out = [];
   for (const line of lines) {
@@ -259,47 +253,64 @@ function getCategoryName(product) {
   return "";
 }
 
-// ✅ NUEVO: traer “características” desde product.template + atributos
+/* =========================
+   ✅ FIX: Template details (safe fields)
+   - evita error por website_description inexistente
+========================= */
 async function odooGetTemplateDetails(tmplId) {
   if (!tmplId) return null;
 
-  const tmpl = await odooExecuteKw("product.template", "read", [[tmplId]], {
-    fields: ["name", "description_sale", "website_description"],
-  });
+  const tryFields = async (fields) => {
+    try {
+      const tmpl = await odooExecuteKw("product.template", "read", [[tmplId]], { fields });
+      const row = Array.isArray(tmpl) ? tmpl[0] : null;
+      return row || null;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (msg.includes("Invalid field")) return null;
+      throw e;
+    }
+  };
 
-  const row = Array.isArray(tmpl) ? tmpl[0] : null;
+  // 1) si tuvieras website/ecommerce
+  let row = await tryFields(["name", "description_sale", "website_description"]);
+  // 2) community común
+  if (!row) row = await tryFields(["name", "description_sale", "description"]);
+  // 3) mínimo
+  if (!row) row = await tryFields(["name", "description_sale"]);
+  if (!row) row = await tryFields(["name"]);
   if (!row) return null;
 
-  const description =
-    (row.website_description && String(row.website_description).trim()) ||
-    (row.description_sale && String(row.description_sale).trim()) ||
-    "";
-
-  // atributos del template (si existen)
-  const lines = await odooExecuteKw(
-    "product.template.attribute.line",
-    "search_read",
-    [[["product_tmpl_id", "=", tmplId]]],
-    { fields: ["attribute_id", "value_ids"], limit: 100 }
+  const descCandidates = [row.website_description, row.description_sale, row.description].filter(
+    (x) => typeof x === "string" && x.trim()
   );
+  const description = descCandidates.length ? descCandidates[0].trim() : null;
 
-  const attrs = [];
-  for (const ln of lines || []) {
-    const attrName = Array.isArray(ln.attribute_id) ? ln.attribute_id[1] : null;
-    const valueIds = Array.isArray(ln.value_ids) ? ln.value_ids : [];
-    let values = [];
-    if (valueIds.length) {
-      const vals = await odooExecuteKw("product.attribute.value", "read", [valueIds], { fields: ["name"] });
-      values = (vals || []).map((v) => v.name).filter(Boolean);
+  // atributos (si existen)
+  let attrs = [];
+  try {
+    const lines = await odooExecuteKw(
+      "product.template.attribute.line",
+      "search_read",
+      [[["product_tmpl_id", "=", tmplId]]],
+      { fields: ["attribute_id", "value_ids"], limit: 100 }
+    );
+
+    for (const ln of lines || []) {
+      const attrName = Array.isArray(ln.attribute_id) ? ln.attribute_id[1] : null;
+      const valueIds = Array.isArray(ln.value_ids) ? ln.value_ids : [];
+      let values = [];
+      if (valueIds.length) {
+        const vals = await odooExecuteKw("product.attribute.value", "read", [valueIds], { fields: ["name"] });
+        values = (vals || []).map((v) => v.name).filter(Boolean);
+      }
+      if (attrName) attrs.push({ name: attrName, values });
     }
-    if (attrName) attrs.push({ name: attrName, values });
+  } catch {
+    attrs = [];
   }
 
-  return {
-    name: row.name || null,
-    description: description || null,
-    attributes: attrs,
-  };
+  return { name: row.name || null, description, attributes: attrs };
 }
 
 /* =========================
@@ -367,12 +378,12 @@ Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
 No inventes nada. Usa SOLO lo que llega de herramientas.
 
 Reglas:
-- Siempre intenta consultar Odoo con tools cuando el usuario pida: opciones, precio, disponibilidad, características, compatibilidad.
-- Si te piden "características" de un producto específico, usa get_product_details.
-- Muestra código + nombre del producto (sí, en este flujo queremos mostrarlo).
+- Siempre consulta Odoo (tools) cuando pidan opciones, precio, disponibilidad, características.
+- Si piden “características” de un producto, usa get_product_details.
+- Muestra código + nombre del producto (sí, aquí lo queremos).
 - Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
-- Precio: solo si viene y es real. Si no hay precio, dilo.
-- Respuestas tipo WhatsApp (cortas y claras), SIN markdown.
+- Precio: solo si viene real; si no hay, dilo.
+- Respuestas tipo WhatsApp: cortas, claras, SIN markdown.
 
 Si preguntan “¿para cuándo llegan?” y NO hay ETA real:
 - di que no hay fecha confirmada en sistema,
@@ -391,7 +402,7 @@ const tools = [
     parameters: {
       type: "object",
       properties: {
-        category_name: { type: "string", description: "Nombre exacto de la categoría en Odoo. Ej: CERRADURAS DIGITALES" },
+        category_name: { type: "string", description: "Nombre exacto de la categoría en Odoo." },
         query: { type: ["string", "null"], description: "Filtro opcional dentro de la categoría. Si no hay, null." },
         availability: { type: "string", enum: ["any", "in_stock", "out_of_stock"], description: "Filtro de existencia" },
         limit: { type: "integer", description: "Máximo de productos a retornar" },
@@ -423,8 +434,8 @@ const tools = [
     parameters: {
       type: "object",
       properties: {
-        category_name: { type: ["string", "null"], description: "Categoría (si se sabe) o null" },
-        product_code: { type: ["string", "null"], description: "Código Odoo (si se sabe) o null" },
+        category_name: { type: ["string", "null"], description: "Categoría o null" },
+        product_code: { type: ["string", "null"], description: "Código Odoo o null" },
       },
       required: ["category_name", "product_code"],
       additionalProperties: false,
@@ -539,19 +550,16 @@ async function tool_get_restock_eta(args, sess) {
   };
 }
 
-// ✅ NUEVO: características reales (si están cargadas en Odoo)
 async function tool_get_product_details(args, sess) {
   const query = String(args?.query || "").trim();
   const limit = Number(args?.limit || 3);
   if (!query) return { ok: false, error: "query vacío" };
 
-  // buscar coincidencias
   const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit, 1), 10) });
   if (!products.length) {
     return { ok: true, found: 0, items: [], note: "No se encontró el producto en Odoo con ese texto/código." };
   }
 
-  // traer disponibilidad y template details (para la mejor coincidencia + top 3)
   const ids = products.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
 
@@ -573,7 +581,6 @@ async function tool_get_product_details(args, sess) {
     });
   }
 
-  // guardar ancla
   const bestCat = items.find((x) => x.category)?.category || null;
   if (bestCat) sess.lastCategory = bestCat;
 
