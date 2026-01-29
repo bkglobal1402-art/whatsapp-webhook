@@ -55,8 +55,15 @@ function norm(s = "") {
 
 function moneyCOP(n) {
   const x = Math.round(Number(n || 0));
-  if (!isFinite(x)) return "$0";
+  if (!isFinite(x)) return null;
   return `$${x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
+}
+
+function shouldShowPrice(listPrice) {
+  const n = Number(listPrice || 0);
+  if (!isFinite(n)) return false;
+  // evita $1 / $0 placeholder
+  return n > 10;
 }
 
 function safeJsonStringify(obj) {
@@ -91,7 +98,30 @@ function shortToolResult(result) {
     }));
     r.items_preview = true;
   }
+  if (r.description && String(r.description).length > 220) {
+    r.description = String(r.description).slice(0, 220) + "…";
+  }
   return r;
+}
+
+function cleanWhatsAppText(text) {
+  // quita markdown fuerte y repetidos sencillos
+  let t = String(text || "");
+
+  // elimina **bold**
+  t = t.replace(/\*\*/g, "");
+
+  // normaliza saltos
+  t = t.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  // quita duplicación exacta de líneas consecutivas
+  const lines = t.split("\n");
+  const out = [];
+  for (const line of lines) {
+    if (out.length && out[out.length - 1].trim() === line.trim()) continue;
+    out.push(line);
+  }
+  return out.join("\n").trim();
 }
 
 /* =========================
@@ -171,7 +201,7 @@ async function odooSearchProducts({ q, limit = 10 }) {
   const qq = String(q || "").trim();
   if (!qq) return [];
   const domain = ["|", ["name", "ilike", qq], ["default_code", "ilike", qq]];
-  const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
+  const fields = ["id", "display_name", "default_code", "list_price", "categ_id", "product_tmpl_id"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
     fields,
     limit,
@@ -188,7 +218,7 @@ async function odooSearchProductsByCategory({ categoryName, q = null, limit = 30
   const qq = String(q || "").trim();
   if (qq) domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
 
-  const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
+  const fields = ["id", "display_name", "default_code", "list_price", "categ_id", "product_tmpl_id"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
     fields,
     limit,
@@ -229,6 +259,49 @@ function getCategoryName(product) {
   return "";
 }
 
+// ✅ NUEVO: traer “características” desde product.template + atributos
+async function odooGetTemplateDetails(tmplId) {
+  if (!tmplId) return null;
+
+  const tmpl = await odooExecuteKw("product.template", "read", [[tmplId]], {
+    fields: ["name", "description_sale", "website_description"],
+  });
+
+  const row = Array.isArray(tmpl) ? tmpl[0] : null;
+  if (!row) return null;
+
+  const description =
+    (row.website_description && String(row.website_description).trim()) ||
+    (row.description_sale && String(row.description_sale).trim()) ||
+    "";
+
+  // atributos del template (si existen)
+  const lines = await odooExecuteKw(
+    "product.template.attribute.line",
+    "search_read",
+    [[["product_tmpl_id", "=", tmplId]]],
+    { fields: ["attribute_id", "value_ids"], limit: 100 }
+  );
+
+  const attrs = [];
+  for (const ln of lines || []) {
+    const attrName = Array.isArray(ln.attribute_id) ? ln.attribute_id[1] : null;
+    const valueIds = Array.isArray(ln.value_ids) ? ln.value_ids : [];
+    let values = [];
+    if (valueIds.length) {
+      const vals = await odooExecuteKw("product.attribute.value", "read", [valueIds], { fields: ["name"] });
+      values = (vals || []).map((v) => v.name).filter(Boolean);
+    }
+    if (attrName) attrs.push({ name: attrName, values });
+  }
+
+  return {
+    name: row.name || null,
+    description: description || null,
+    attributes: attrs,
+  };
+}
+
 /* =========================
    WhatsApp Sender
 ========================= */
@@ -243,7 +316,7 @@ async function sendWhatsAppText(to, text) {
     messaging_product: "whatsapp",
     to,
     type: "text",
-    text: { body: truncateWhatsApp(text) },
+    text: { body: truncateWhatsApp(cleanWhatsAppText(text)) },
   };
 
   const resp = await fetch(url, {
@@ -287,26 +360,28 @@ function resetSession(from) {
 }
 
 /* =========================
-   Prompt
+   Prompt (asesor)
 ========================= */
 const BK_PROMPT = `
-Eres BK GLOBAL IA, el asesor comercial y técnico oficial de BK GLOBAL S.A.S (Colombia).
-No inventes nada. Usa SOLO la info de herramientas.
+Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
+No inventes nada. Usa SOLO lo que llega de herramientas.
 
-Cuando pidan opciones: lista productos con y sin existencia.
-- Muestra código (como viene de Odoo) y precio si existe.
-- No muestres cantidades de stock: solo ✅ Hay / ❌ No hay.
+Reglas:
+- Siempre intenta consultar Odoo con tools cuando el usuario pida: opciones, precio, disponibilidad, características, compatibilidad.
+- Si te piden "características" de un producto específico, usa get_product_details.
+- Muestra código + nombre del producto (sí, en este flujo queremos mostrarlo).
+- Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
+- Precio: solo si viene y es real. Si no hay precio, dilo.
+- Respuestas tipo WhatsApp (cortas y claras), SIN markdown.
 
-Si preguntan "¿para cuándo llegan?" y NO hay ETA real:
-- di que no hay fecha confirmada en sistema
-- ofrece verificar
-- ofrece alternativas disponibles si aplica
-
-Respuestas cortas tipo WhatsApp (6-12 líneas).
+Si preguntan “¿para cuándo llegan?” y NO hay ETA real:
+- di que no hay fecha confirmada en sistema,
+- ofrece verificar,
+- ofrece alternativas con existencia.
 `;
 
 /* =========================
-   Tools (STRICT FIXED)
+   Tools (strict OK)
 ========================= */
 const tools = [
   {
@@ -317,11 +392,10 @@ const tools = [
       type: "object",
       properties: {
         category_name: { type: "string", description: "Nombre exacto de la categoría en Odoo. Ej: CERRADURAS DIGITALES" },
-        query: { type: ["string", "null"], description: "Filtro opcional dentro de la categoría. Si no hay, usa null." },
+        query: { type: ["string", "null"], description: "Filtro opcional dentro de la categoría. Si no hay, null." },
         availability: { type: "string", enum: ["any", "in_stock", "out_of_stock"], description: "Filtro de existencia" },
         limit: { type: "integer", description: "Máximo de productos a retornar" },
       },
-      // ✅ strict=true requiere que required incluya TODAS las keys
       required: ["category_name", "query", "availability", "limit"],
       additionalProperties: false,
     },
@@ -357,6 +431,21 @@ const tools = [
     },
     strict: true,
   },
+  {
+    type: "function",
+    name: "get_product_details",
+    description: "Obtiene características reales del producto desde Odoo (descripción/atributos) usando código o texto.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Código (ej CD104) o texto del producto" },
+        limit: { type: "integer", description: "Máximo coincidencias (normal 3-5)" },
+      },
+      required: ["query", "limit"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
 ];
 
 /* =========================
@@ -369,7 +458,6 @@ async function tool_list_products_by_category(args, sess) {
   const limit = Number(args?.limit || OPTIONS_LIMIT);
 
   if (!category_name) return { ok: false, error: "category_name vacío" };
-
   sess.lastCategory = category_name;
 
   const products = await odooSearchProductsByCategory({
@@ -385,11 +473,12 @@ async function tool_list_products_by_category(args, sess) {
 
   const items = products.map((p) => {
     const available = (availMap.get(p.id) || 0) > 0;
+    const priceOk = shouldShowPrice(p.list_price);
     return {
       id: p.id,
       name: p.display_name,
       code: p.default_code || null,
-      price_cop: moneyCOP(p.list_price || 0),
+      price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
       in_stock: !!available,
       category: getCategoryName(p) || category_name,
     };
@@ -398,10 +487,7 @@ async function tool_list_products_by_category(args, sess) {
   let filtered = items;
   if (availability === "in_stock") filtered = items.filter((x) => x.in_stock);
   if (availability === "out_of_stock") filtered = items.filter((x) => !x.in_stock);
-
-  if (availability === "any") {
-    filtered = [...filtered.filter((x) => x.in_stock), ...filtered.filter((x) => !x.in_stock)];
-  }
+  if (availability === "any") filtered = [...filtered.filter((x) => x.in_stock), ...filtered.filter((x) => !x.in_stock)];
 
   filtered = pick(filtered, Math.min(Math.max(limit, 1), 60));
   return { ok: true, category_name, count: filtered.length, items: filtered };
@@ -420,13 +506,15 @@ async function tool_search_products(args, sess) {
 
   const items = products.map((p) => {
     const available = (availMap.get(p.id) || 0) > 0;
+    const priceOk = shouldShowPrice(p.list_price);
     return {
       id: p.id,
       name: p.display_name,
       code: p.default_code || null,
-      price_cop: moneyCOP(p.list_price || 0),
+      price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
       in_stock: !!available,
       category: getCategoryName(p) || null,
+      product_tmpl_id: Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id,
     };
   });
 
@@ -440,8 +528,7 @@ async function tool_search_products(args, sess) {
 async function tool_get_restock_eta(args, sess) {
   const category_name =
     args?.category_name === null ? null : String(args?.category_name || sess.lastCategory || "").trim() || null;
-  const product_code =
-    args?.product_code === null ? null : String(args?.product_code || "").trim() || null;
+  const product_code = args?.product_code === null ? null : String(args?.product_code || "").trim() || null;
 
   return {
     ok: true,
@@ -452,10 +539,52 @@ async function tool_get_restock_eta(args, sess) {
   };
 }
 
+// ✅ NUEVO: características reales (si están cargadas en Odoo)
+async function tool_get_product_details(args, sess) {
+  const query = String(args?.query || "").trim();
+  const limit = Number(args?.limit || 3);
+  if (!query) return { ok: false, error: "query vacío" };
+
+  // buscar coincidencias
+  const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit, 1), 10) });
+  if (!products.length) {
+    return { ok: true, found: 0, items: [], note: "No se encontró el producto en Odoo con ese texto/código." };
+  }
+
+  // traer disponibilidad y template details (para la mejor coincidencia + top 3)
+  const ids = products.map((p) => p.id);
+  const availMap = await odooGetAvailabilityMap(ids);
+
+  const items = [];
+  for (const p of products.slice(0, 3)) {
+    const available = (availMap.get(p.id) || 0) > 0;
+    const tmplId = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
+    const tmpl = await odooGetTemplateDetails(tmplId);
+
+    const priceOk = shouldShowPrice(p.list_price);
+    items.push({
+      name: p.display_name,
+      code: p.default_code || null,
+      in_stock: !!available,
+      price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
+      category: getCategoryName(p) || null,
+      description: tmpl?.description || null,
+      attributes: tmpl?.attributes || [],
+    });
+  }
+
+  // guardar ancla
+  const bestCat = items.find((x) => x.category)?.category || null;
+  if (bestCat) sess.lastCategory = bestCat;
+
+  return { ok: true, found: products.length, items };
+}
+
 async function callToolByName(name, args, sess) {
   if (name === "list_products_by_category") return await tool_list_products_by_category(args, sess);
   if (name === "search_products") return await tool_search_products(args, sess);
   if (name === "get_restock_eta") return await tool_get_restock_eta(args, sess);
+  if (name === "get_product_details") return await tool_get_product_details(args, sess);
   return { ok: false, error: `Tool desconocida: ${name}` };
 }
 
@@ -492,7 +621,7 @@ async function runAgent({ from, userText }) {
 
     const toolCalls = (response.output || []).filter((it) => it.type === "function_call");
     if (!toolCalls.length) {
-      const out = (response.output_text || "").trim();
+      const out = cleanWhatsAppText((response.output_text || "").trim());
       const finalText = out || "Listo 👍 ¿Me confirmas qué estás buscando exactamente para recomendarte opciones?";
       dlog("🤖 Reply to user:", finalText);
       return finalText;
