@@ -151,15 +151,6 @@ function isCellphoneContext(items, userText) {
    Session memory (RAM)
 ========================= */
 const sessions = new Map();
-/*
-sessions.get(from) = {
-  pending: "pick" | "variant" | "color" | null,
-  items: [...],
-  variantKeys?: [...],
-  lastOptions?: [...],
-  lastTopicKey?: string
-}
-*/
 
 /* =========================
    Catalog cache
@@ -262,33 +253,40 @@ function searchCatalog(query, limit = 30) {
 }
 
 /* =========================
-   Odoo JSON-RPC (NUEVO)
+   Odoo JSON-RPC (FIX /jsonrpc) ✅
 ========================= */
 const ODOO_URL = process.env.ODOO_URL; // ej: http://104.225.217.59:5033/odoo
-const ODOO_DB = process.env.ODOO_DB;   // ej: odoo (o el nombre real)
+const ODOO_DB = process.env.ODOO_DB;
 const ODOO_USER = process.env.ODOO_USER;
 const ODOO_PASS = process.env.ODOO_PASS;
 
-async function odooRpc(path, payload) {
+async function odooJsonRpc(payload) {
   if (!ODOO_URL) throw new Error("Missing ODOO_URL env var");
-  const res = await fetch(`${ODOO_URL}${path}`, {
+
+  const res = await fetch(`${ODOO_URL}/jsonrpc`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
     body: JSON.stringify(payload),
   });
 
   const text = await res.text().catch(() => "");
-  let json = null;
+  let data;
   try {
-    json = text ? JSON.parse(text) : null;
-  } catch (_) {
-    // si odoo devuelve HTML por error, lo dejamos como texto
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Odoo returned non-JSON: ${text.slice(0, 200)}`);
   }
 
   if (!res.ok) {
     throw new Error(`Odoo HTTP ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
   }
-  return json;
+  if (data?.error) {
+    throw new Error(`Odoo JSON-RPC error: ${JSON.stringify(data.error)}`);
+  }
+  return data.result;
 }
 
 async function odooAuthenticate() {
@@ -296,17 +294,35 @@ async function odooAuthenticate() {
   if (!ODOO_USER) throw new Error("Missing ODOO_USER env var");
   if (!ODOO_PASS) throw new Error("Missing ODOO_PASS env var");
 
-  const data = await odooRpc("/web/session/authenticate", {
+  const uid = await odooJsonRpc({
     jsonrpc: "2.0",
     method: "call",
-    params: { db: ODOO_DB, login: ODOO_USER, password: ODOO_PASS },
+    params: {
+      service: "common",
+      method: "authenticate",
+      args: [ODOO_DB, ODOO_USER, ODOO_PASS, {}],
+    },
     id: Date.now(),
   });
 
-  if (data?.error) throw new Error(`Auth error: ${JSON.stringify(data.error)}`);
-  const uid = data?.result?.uid;
-  if (!uid) throw new Error("No uid returned. Revisa ODOO_DB/ODOO_USER/ODOO_PASS.");
+  if (!uid) throw new Error("Auth failed (uid vacío). Revisa DB/usuario/clave.");
   return uid;
+}
+
+// (Listo para usar luego: productos/stock/precios)
+async function odooExecuteKw(model, method, args = [], kwargs = {}) {
+  const uid = await odooAuthenticate();
+
+  return odooJsonRpc({
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [ODOO_DB, uid, ODOO_PASS, model, method, args, kwargs],
+    },
+    id: Date.now(),
+  });
 }
 
 /* =========================
@@ -489,7 +505,7 @@ async function sendWhatsAppText(to, text) {
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-/** NUEVO: Test Odoo */
+/** ✅ Test Odoo (NUEVO) */
 app.get("/test-odoo", async (req, res) => {
   try {
     const uid = await odooAuthenticate();
@@ -530,11 +546,9 @@ app.post("/webhook", async (req, res) => {
     await loadCatalogFromCSV();
     const sess = sessions.get(from) || { pending: null };
 
-    // 1) Clasificar intención (DURO)
     const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
     const intent = intentObj?.intent || "SEARCH";
 
-    // 2) Manejos rápidos por intención + estado
     if (intent === "GREETING") {
       const reply = await generateReplyWithOpenAI({
         userText: text,
@@ -572,7 +586,6 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      // color si aplica
       const c = intentObj.color || detectColor(text);
       if (hasColorMix(filtered) && !c) {
         sessions.set(from, { ...sess, pending: "color", items: filtered });
@@ -643,7 +656,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // PRICES_ALL_LISTED: si hay lista activa, responder precios de todas las listadas
     if (intent === "PRICES_ALL_LISTED" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
       const opts = sess.lastOptions.map(toSafeOption);
 
@@ -665,7 +677,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // PICK_OPTION: si hay lista activa, responder opción elegida
     if (intent === "PICK_OPTION" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
       const n = intentObj.choice_number;
       const idx = typeof n === "number" ? n - 1 : -1;
@@ -688,7 +699,6 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // CODE_LOOKUP: buscar por código
     if (intent === "CODE_LOOKUP" || looksLikeCode(text)) {
       const code = intentObj.code || String(text).trim();
       const byCode = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(code));
@@ -710,10 +720,8 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // 3) SEARCH (o fallback): buscar por catálogo (con ancla por tema)
     let matches = searchCatalog(intentObj.search_hint || text, 30);
 
-    // ancla por grupo si el mensaje es genérico y ya había tema
     if (sess.lastTopicKey) {
       const tnorm = normalizeText(text);
       const isGenericFollowup =
@@ -736,7 +744,6 @@ app.post("/webhook", async (req, res) => {
     console.log("🔎 Search clean:", cleanQuery(text));
     console.log("🔎 Matches:", matches.slice(0, 5).map((m) => m.Producto));
 
-    // sin coincidencias
     if (matches.length === 0) {
       const reply = await generateReplyWithOpenAI({
         userText: text,
@@ -748,7 +755,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Variantes SOLO si parece celulares
     const allowVariants = isCellphoneContext(matches, text);
     if (allowVariants) {
       const userVariant = intentObj.variant || detectVariantFromText(text);
@@ -777,7 +783,6 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      // color si aplica
       const c = intentObj.color || detectColor(text);
       if (hasColorMix(refined) && !c) {
         sessions.set(from, { pending: "color", items: refined, lastTopicKey: sess.lastTopicKey || null });
@@ -797,7 +802,6 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // match único => responder
     if (matches.length === 1) {
       const p = matches[0];
       const safe = toSafeOption(p);
@@ -806,9 +810,7 @@ app.post("/webhook", async (req, res) => {
         userText: text,
         mode: "RESPONDER_PRECIO_Y_EXISTENCIA_FINAL",
         catalogData: { producto: safe },
-        fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${
-          safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-        }`,
+        fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`,
       });
 
       const topicKey = normalizeText(p.Nombre_Grupo || "");
@@ -817,7 +819,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // múltiples => listar 3 y guardar estado pick
     const lastOptions = matches.slice(0, 3);
     const topicKey = normalizeText(lastOptions[0]?.Nombre_Grupo || "");
 
