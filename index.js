@@ -8,11 +8,11 @@ const app = express();
 app.use(express.json());
 
 /* =========================
-   ENV (Railway Variables)
+   ENV
 ========================= */
-const ODOO_URL = process.env.ODOO_URL;      // ej: http://104.225.217.59:5033
-const ODOO_DB = process.env.ODOO_DB;        // ej: odoo_admin_pro
-const ODOO_USER = process.env.ODOO_USER;    // ej: bot@bkglobal.com.co
+const ODOO_URL = process.env.ODOO_URL;      // http://104.225.217.59:5033
+const ODOO_DB = process.env.ODOO_DB;        // odoo_admin_pro
+const ODOO_USER = process.env.ODOO_USER;    // bot@bkglobal.com.co
 const ODOO_PASS = process.env.ODOO_PASS;
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
@@ -39,17 +39,15 @@ function norm(s = "") {
     .trim();
 }
 
+function isLikelyCode(text) {
+  const t = String(text || "").trim();
+  return /^\d{4,}$/.test(t);
+}
+
 function moneyCOP(n) {
   const x = Math.round(Number(n || 0));
   if (!isFinite(x)) return "$0";
   return `$${x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
-}
-
-function pickOptionNumber(text) {
-  const t = norm(text);
-  const m = t.match(/\b(1|2|3)\b/);
-  if (m) return Number(m[1]);
-  return null;
 }
 
 /* =========================
@@ -62,7 +60,6 @@ async function odooJsonRpc({ service, method, args = [], kwargs = {} }) {
   if (!ODOO_URL || !ODOO_DB || !ODOO_USER || !ODOO_PASS) {
     throw new Error("Missing ODOO_URL / ODOO_DB / ODOO_USER / ODOO_PASS");
   }
-
   const base = getRpcBase(ODOO_URL);
   const url = `${base}/jsonrpc`;
 
@@ -81,9 +78,7 @@ async function odooJsonRpc({ service, method, args = [], kwargs = {} }) {
 
   const data = await resp.json().catch(() => null);
 
-  if (!resp.ok) {
-    throw new Error(`Odoo HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 300)}`);
-  }
+  if (!resp.ok) throw new Error(`Odoo HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 250)}`);
   if (!data) throw new Error("Odoo returned empty response");
   if (data.error) {
     const msg = data.error?.data?.message || data.error?.message || JSON.stringify(data.error);
@@ -116,16 +111,17 @@ async function odooExecuteKw(model, method, args = [], kwargs = {}) {
   });
 }
 
-async function odooFindProducts({ code = null, q = null, limit = 5 }) {
+async function odooFindProducts({ code = null, q = null, limit = 3 }) {
   const domain = [];
   if (code) {
     domain.push(["default_code", "=", String(code).trim()]);
   } else if (q) {
     const qq = String(q).trim();
+    // Busca por nombre o por referencia
     domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
   } else return [];
 
-  const fields = ["id", "display_name", "default_code", "list_price", "type"];
+  const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
     fields,
     limit,
@@ -136,8 +132,6 @@ async function odooFindProducts({ code = null, q = null, limit = 5 }) {
 }
 
 async function odooHasStock(productId) {
-  if (!productId) return false;
-
   const quants = await odooExecuteKw(
     "stock.quant",
     "search_read",
@@ -162,8 +156,46 @@ async function odooGetPrice(product) {
   return isFinite(p) ? p : 0;
 }
 
+async function odooGetCategoryName(product) {
+  // categ_id normalmente viene como [id, "Nombre"]
+  const c = product?.categ_id;
+  if (Array.isArray(c) && typeof c[1] === "string") return c[1];
+  return "";
+}
+
+function allowSuggestionsByCategoryName(catName = "") {
+  const c = norm(catName);
+  // SOLO cerraduras e intercomunicadores
+  return c.includes("cerrad") || c.includes("intercom");
+}
+
+async function odooSuggestAlternatives({ product, limit = 3 }) {
+  // Alternativas dentro de la misma categoría (si existe)
+  const categ = product?.categ_id;
+  const categId = Array.isArray(categ) ? categ[0] : null;
+  if (!categId) return [];
+
+  // Traemos varios y filtramos los que tengan stock
+  const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
+  const candidates = await odooExecuteKw(
+    "product.product",
+    "search_read",
+    [[["categ_id", "=", categId], ["id", "!=", product.id]]],
+    { fields, limit: 25, order: "id desc" }
+  );
+
+  const out = [];
+  for (const p of candidates || []) {
+    const has = await odooHasStock(p.id);
+    if (!has) continue;
+    out.push(p);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /* =========================
-   OpenAI (C: interpreta + redacta)
+   OpenAI
 ========================= */
 async function openaiChatJSON({ system, user, temperature = 0 }) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -185,18 +217,16 @@ async function openaiChatJSON({ system, user, temperature = 0 }) {
   });
 
   const data = await resp.json().catch(() => null);
-  if (!resp.ok) throw new Error(`OpenAI HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 300)}`);
+  if (!resp.ok) throw new Error(`OpenAI HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 250)}`);
   const txt = data?.choices?.[0]?.message?.content?.trim() || "";
 
+  // Debe ser JSON
   try {
     return JSON.parse(txt);
   } catch {
-    // fallback: intenta extraer JSON si viene con texto
     const start = txt.indexOf("{");
     const end = txt.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(txt.slice(start, end + 1));
-    }
+    if (start >= 0 && end > start) return JSON.parse(txt.slice(start, end + 1));
     throw new Error(`OpenAI returned non-JSON: ${txt.slice(0, 200)}`);
   }
 }
@@ -204,79 +234,64 @@ async function openaiChatJSON({ system, user, temperature = 0 }) {
 async function classifyIntentWithOpenAI({ userText, session }) {
   const sys = `
 Eres un clasificador de intención para un bot de WhatsApp de BK GLOBAL.
-Devuelve SOLO JSON válido con estas llaves:
+Devuelve SOLO JSON válido:
 
 {
   "intent": "GREETING" | "RESET" | "PICK_OPTION" | "CODE_LOOKUP" | "SEARCH" | "ASK_CLARIFY",
   "choice_number": 1|2|3|null,
   "code": "..."|null,
-  "query": "..."|null,
-  "want_price": true|false,
-  "want_stock": true|false
+  "query": "..."|null
 }
 
 Reglas:
 - Saludos (hola/buenas/hey) => GREETING
 - Reset (reiniciar/cancelar/empezar/reset) => RESET
-- Si dice 1/2/3 o "la 2" => PICK_OPTION y choice_number
-- Si parece código (>=4 dígitos solo números) => CODE_LOOKUP y code
-- Si es búsqueda por texto => SEARCH y query (versión limpia)
+- Si dice 1/2/3 o "la 2" => PICK_OPTION
+- Si texto es número >=4 dígitos => CODE_LOOKUP
+- Si es búsqueda por texto => SEARCH y query (limpia)
 - Si es ambiguo => ASK_CLARIFY
-
-Detección precio/stock:
-- Si menciona precio/vale/cuesta/valor => want_price=true
-- Si menciona hay/existencia/stock/disponible => want_stock=true
-- Si no menciona nada => ambos true (responder completo)
-
-No inventes.
 `;
 
   const sess = session || {};
   const listed = Array.isArray(sess.lastOptions)
-    ? sess.lastOptions.map((p, i) => ({ n: i + 1, display_name: p.display_name, default_code: p.default_code }))
+    ? sess.lastOptions.map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code }))
     : [];
 
   const user = `
 USER_TEXT: ${userText}
-
 SESSION:
 - pending: ${sess.pending || "null"}
-- has_listed_options: ${listed.length > 0}
 - listed_options: ${JSON.stringify(listed)}
 `;
 
   const obj = await openaiChatJSON({ system: sys, user, temperature: 0 });
-
-  // fallback hardening
-  if (!obj?.intent) return { intent: "SEARCH", choice_number: null, code: null, query: null, want_price: true, want_stock: true };
-  if (obj.want_price !== false && obj.want_price !== true) obj.want_price = true;
-  if (obj.want_stock !== false && obj.want_stock !== true) obj.want_stock = true;
+  if (!obj?.intent) return { intent: "SEARCH", choice_number: null, code: null, query: userText };
   return obj;
 }
 
 async function generateReplyWithOpenAI({ mode, userText, data, fallback }) {
   const sys = `
-Eres un asesor comercial por WhatsApp de BK GLOBAL (Colombia).
+Eres un asesor comercial VENDEDOR por WhatsApp de BK GLOBAL (Colombia).
 
 REGLAS CRÍTICAS:
-- NO inventes precio, stock, productos o códigos.
+- NO inventes precio, existencia, productos o códigos.
 - Usa ÚNICAMENTE la info en DATA.
-- NUNCA muestres cantidades de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
-- Respuesta corta y clara (máx 6 líneas).
-- Devuelve SOLO JSON válido: {"reply":"..."}.
+- NUNCA muestres cantidades de stock. Solo:
+  "✅ Hay existencia" o "❌ Sin existencia"
+- Siempre amable, vendedor, pero corto (máx 6 líneas).
+- Si no hay stock y hay alternativas permitidas, sugiere 1 a 3 alternativas.
+- Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
 `;
 
   const user = `
 MODE: ${mode}
-
 USER_TEXT: ${userText}
-
 DATA (fuente única):
 ${JSON.stringify(data, null, 2)}
 `;
 
   try {
-    const obj = await openaiChatJSON({ system: sys, user, temperature: 0.2 });
+    const obj = await openaiChatJSON({ system: sys, user, temperature: 0.3 });
     if (obj?.reply && typeof obj.reply === "string") return obj.reply.trim();
   } catch (e) {
     console.error("⚠️ OpenAI reply error:", e.message || e);
@@ -285,7 +300,7 @@ ${JSON.stringify(data, null, 2)}
 }
 
 /* =========================
-   WhatsApp sender
+   WhatsApp Sender
 ========================= */
 async function sendWhatsAppText(to, text) {
   if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
@@ -315,18 +330,15 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   Session + Dedup (Meta test number fix)
+   Session + Dedup (Meta Test Number fix)
 ========================= */
-const sessions = new Map(); // per phone
-// sessions.get(from) = { pending:"pick"|null, lastOptions:[...], want_price, want_stock }
-
-const seenMsg = new Map(); // msgId -> timestamp
+const sessions = new Map(); // from -> { pending, lastOptions }
+const seenMsg = new Map();  // msgId -> ts
 const SEEN_TTL = 10 * 60 * 1000;
 
 function seenBefore(msgId) {
   if (!msgId) return false;
   const now = Date.now();
-  // cleanup sometimes
   for (const [k, ts] of seenMsg.entries()) {
     if (now - ts > SEEN_TTL) seenMsg.delete(k);
   }
@@ -362,7 +374,6 @@ app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
   if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
@@ -385,7 +396,7 @@ app.post("/webhook", async (req, res) => {
 
     if (!from || !text) return;
 
-    // ✅ Dedup (Test number often re-sends same message)
+    // Dedup (Meta test number reenvía)
     if (seenBefore(msgId)) {
       console.log("🔁 Duplicate message ignored:", msgId);
       return;
@@ -393,37 +404,44 @@ app.post("/webhook", async (req, res) => {
 
     console.log("✅ Incoming message:", { from, text, msgId });
 
-    // Hard reset if user says "hola" or reset words (extra protection)
     const tnorm = norm(text);
-    const greetings = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey"];
-    const resets = ["reiniciar", "reset", "cancelar", "empezar", "borrar"];
-    if (greetings.includes(tnorm) || resets.includes(tnorm)) {
+    const greetings = new Set(["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey"]);
+    const resets = new Set(["reiniciar", "reset", "cancelar", "empezar", "borrar"]);
+
+    // ✅ Regla 1: Siempre saludar si dicen hola (y resetear contexto)
+    if (greetings.has(tnorm)) {
       sessions.delete(from);
       const reply = await generateReplyWithOpenAI({
         mode: "SALUDO",
         userText: text,
-        data: { note: "Solo saluda y pregunta en qué ayudar." },
-        fallback: "Hola 👋 ¿En qué te puedo ayudar?",
+        data: { note: "Saluda y pregunta qué necesita. Tono vendedor." },
+        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (puedes enviarme el código o el nombre del producto)",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    const sess = sessions.get(from) || { pending: null, lastOptions: [], want_price: true, want_stock: true };
-
-    // 1) OpenAI: clasificar intención
-    const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
-
-    // 2) Manejo de reset por intención
-    if (intentObj.intent === "RESET") {
+    // Reset manual
+    if (resets.has(tnorm)) {
       sessions.delete(from);
-      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando?");
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando? (código o nombre)");
       return;
     }
 
-    // 3) Si el usuario está escogiendo 1/2/3
+    const sess = sessions.get(from) || { pending: null, lastOptions: [] };
+
+    // OpenAI: intención
+    const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
+
+    if (intentObj.intent === "RESET") {
+      sessions.delete(from);
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando? (código o nombre)");
+      return;
+    }
+
+    // Si estaban en selección 1/2/3
     if (sess.pending === "pick" || intentObj.intent === "PICK_OPTION") {
-      const n = intentObj.choice_number ?? pickOptionNumber(text);
+      const n = intentObj.choice_number ?? (tnorm.match(/\b(1|2|3)\b/) ? Number(RegExp.$1) : null);
       const idx = typeof n === "number" ? n - 1 : -1;
       const chosen = sess.lastOptions?.[idx];
 
@@ -432,27 +450,53 @@ app.post("/webhook", async (req, res) => {
           mode: "PEDIR_OPCION",
           userText: text,
           data: { opciones: (sess.lastOptions || []).map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code })) },
-          fallback: "Dime 1, 2 o 3 para escoger una opción 🙂",
+          fallback: "¿Cuál opción eliges? respóndeme con 1, 2 o 3 🙂",
         });
         await sendWhatsAppText(from, reply);
         return;
       }
 
-      const price = intentObj.want_price ? await odooGetPrice(chosen) : null;
-      const has = intentObj.want_stock ? await odooHasStock(chosen.id) : null;
+      const price = await odooGetPrice(chosen);
+      const has = await odooHasStock(chosen.id);
+      const catName = await odooGetCategoryName(chosen);
+
+      let alternatives = [];
+      if (!has && allowSuggestionsByCategoryName(catName)) {
+        const alts = await odooSuggestAlternatives({ product: chosen, limit: 3 });
+        alternatives = await Promise.all(
+          alts.map(async (p) => ({
+            nombre: p.display_name,
+            codigo: p.default_code || null,
+            precio: moneyCOP(await odooGetPrice(p)),
+            existencia: "HAY",
+          }))
+        );
+      }
 
       const safe = {
-        nombre: chosen.display_name,
-        codigo: chosen.default_code || null,
-        precio: intentObj.want_price ? moneyCOP(price) : null,
-        existencia: intentObj.want_stock ? (has ? "HAY" : "NO_HAY") : null,
+        producto: {
+          nombre: chosen.display_name,
+          codigo: chosen.default_code || null,
+          categoria: catName || null,
+          precio: moneyCOP(price),
+          existencia: has ? "HAY" : "NO_HAY",
+        },
+        alternativas: alternatives,
       };
+
+      const fallback =
+        `${safe.producto.nombre}${safe.producto.codigo ? ` (${safe.producto.codigo})` : ""}\n` +
+        `Precio: ${safe.producto.precio}\n` +
+        (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
+        (alternatives.length ? "\n\nTe puedo ofrecer estas alternativas con existencia:\n" +
+          alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
+          : "");
 
       const reply = await generateReplyWithOpenAI({
         mode: "RESPUESTA_FINAL",
         userText: text,
-        data: { producto: safe },
-        fallback: `${safe.nombre}${safe.codigo ? ` (${safe.codigo})` : ""}\n${safe.precio ? `Precio: ${safe.precio}\n` : ""}${safe.existencia ? (safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") : ""}`.trim(),
+        data: safe,
+        fallback,
       });
 
       sessions.delete(from);
@@ -460,76 +504,116 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 4) Buscar en Odoo (por código o por query)
+    // Buscar por código o query
     let products = [];
-
-    if (intentObj.intent === "CODE_LOOKUP" && intentObj.code) {
-      products = await odooFindProducts({ code: intentObj.code, limit: 3 });
-    } else {
-      // SEARCH
-      const q = intentObj.query ? String(intentObj.query) : String(text);
+    if (intentObj.intent === "CODE_LOOKUP" || isLikelyCode(text)) {
+      const code = intentObj.code || String(text).trim();
+      products = await odooFindProducts({ code, limit: 3 });
+    } else if (intentObj.intent === "SEARCH") {
+      const q = intentObj.query || text;
       products = await odooFindProducts({ q, limit: 3 });
+    } else if (intentObj.intent === "ASK_CLARIFY") {
+      const reply = await generateReplyWithOpenAI({
+        mode: "ACLARAR",
+        userText: text,
+        data: { tips: ["Envíame el código si lo tienes (ej: 103317).", "O el nombre exacto (ej: display iphone 11 pro max)."] },
+        fallback: "¿Me compartes el código o el nombre exacto del producto para revisarte precio y disponibilidad? 🙂",
+      });
+      await sendWhatsAppText(from, reply);
+      return;
+    } else {
+      // fallback búsqueda
+      products = await odooFindProducts({ q: text, limit: 3 });
     }
 
-    // 5) Si no hay coincidencias: OpenAI pide aclaración con guía
+    // Sin coincidencias
     if (!products.length) {
       const reply = await generateReplyWithOpenAI({
         mode: "SIN_COINCIDENCIAS",
         userText: text,
-        data: { tips: ["Pide el código del producto (si lo tiene).", "O el nombre exacto (ej: 'display iphone 11 pro max')."] },
+        data: { tips: ["Envíame el código del producto.", "O el nombre exacto como lo manejas en Odoo."] },
         fallback: "No lo encontré en Odoo. ¿Me envías el código o el nombre exacto? 🙏",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // 6) Si hay 1 producto: responder directo
+    // Único producto
     if (products.length === 1) {
       const p = products[0];
-      const price = intentObj.want_price ? await odooGetPrice(p) : null;
-      const has = intentObj.want_stock ? await odooHasStock(p.id) : null;
+      const price = await odooGetPrice(p);
+      const has = await odooHasStock(p.id);
+      const catName = await odooGetCategoryName(p);
+
+      let alternatives = [];
+      if (!has && allowSuggestionsByCategoryName(catName)) {
+        const alts = await odooSuggestAlternatives({ product: p, limit: 3 });
+        alternatives = await Promise.all(
+          alts.map(async (x) => ({
+            nombre: x.display_name,
+            codigo: x.default_code || null,
+            precio: moneyCOP(await odooGetPrice(x)),
+            existencia: "HAY",
+          }))
+        );
+      }
 
       const safe = {
-        nombre: p.display_name,
-        codigo: p.default_code || null,
-        precio: intentObj.want_price ? moneyCOP(price) : null,
-        existencia: intentObj.want_stock ? (has ? "HAY" : "NO_HAY") : null,
+        producto: {
+          nombre: p.display_name,
+          codigo: p.default_code || null,
+          categoria: catName || null,
+          precio: moneyCOP(price),
+          existencia: has ? "HAY" : "NO_HAY",
+        },
+        alternativas: alternatives,
       };
+
+      const fallback =
+        `${safe.producto.nombre}${safe.producto.codigo ? ` (${safe.producto.codigo})` : ""}\n` +
+        `Precio: ${safe.producto.precio}\n` +
+        (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
+        (alternatives.length ? "\n\nTe puedo ofrecer estas alternativas con existencia:\n" +
+          alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
+          : "");
 
       const reply = await generateReplyWithOpenAI({
         mode: "RESPUESTA_FINAL",
         userText: text,
-        data: { producto: safe },
-        fallback: `${safe.nombre}${safe.codigo ? ` (${safe.codigo})` : ""}\n${safe.precio ? `Precio: ${safe.precio}\n` : ""}${safe.existencia ? (safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") : ""}`.trim(),
+        data: safe,
+        fallback,
       });
 
-      sessions.set(from, { pending: null, lastOptions: [p], want_price: intentObj.want_price, want_stock: intentObj.want_stock });
+      // Guardar estado mínimo (por si pregunta “y la otra?”)
+      sessions.set(from, { pending: null, lastOptions: [p] });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // 7) Si hay varias: listar 3 y pedir elección (OpenAI redacta)
-    sessions.set(from, { pending: "pick", lastOptions: products, want_price: intentObj.want_price, want_stock: intentObj.want_stock });
+    // Múltiples: lista y pedir elección
+    sessions.set(from, { pending: "pick", lastOptions: products });
 
-    const optionsSafe = products.map((p, i) => ({
+    const opciones = products.map((p, i) => ({
       n: i + 1,
       nombre: p.display_name,
       codigo: p.default_code || null,
     }));
 
+    const fallback =
+      `Encontré estas opciones:\n` +
+      opciones.map((o) => `${o.n}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}`).join("\n") +
+      `\n\n¿Cuál te interesa? (1, 2 o 3)`;
+
     const reply = await generateReplyWithOpenAI({
       mode: "LISTAR_OPCIONES",
       userText: text,
-      data: { opciones: optionsSafe },
-      fallback:
-        `Encontré estas opciones:\n` +
-        optionsSafe.map((o) => `${o.n}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}`).join("\n") +
-        `\n\n¿Cuál te interesa? (1, 2 o 3)`,
+      data: { opciones },
+      fallback,
     });
 
     await sendWhatsAppText(from, reply);
   } catch (err) {
-    console.error("❌ Webhook error:", err);
+    console.error("❌ Webhook error:", err.message || err);
   }
 });
 
