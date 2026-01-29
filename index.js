@@ -15,7 +15,6 @@ app.use(express.json());
 // ODOO_USER: bot@bkglobal.com.co
 // ODOO_PASS: (tu clave del usuario bot)
 //
-// Understands:
 // VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
 // OPENAI_API_KEY (opcional) + OPENAI_MODEL (opcional)
 
@@ -30,6 +29,69 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+/* =========================
+   ✅ SYSTEM PROMPT (TU PROMPT)
+========================= */
+const BK_SYSTEM_PROMPT = `
+Eres BK GLOBAL IA, el asesor comercial y técnico oficial de BK GLOBAL S.A.S (Colombia).
+
+BK GLOBAL se dedica a la venta de:
+- Repuestos de celulares y tablets
+- Cerraduras digitales
+- GPS para vehículos (incluyendo modelos con anti-inhibidor)
+- Intercomunicadores para moto
+- Tiras LED para televisores
+- Accesorios tecnológicos
+
+Tu comportamiento debe ser el de un asesor humano experto, cercano y confiable.
+
+REGLAS CLAVE:
+1. El cliente NO conoce nombres técnicos ni códigos internos.
+2. Nunca menciones referencias, SKU, códigos ni nombres internos.
+3. Nunca inventes productos, precios, compatibilidades ni disponibilidad.
+4. Si no tienes información exacta, dilo claramente y ofrece verificar.
+5. Haz preguntas cortas y necesarias, no interrogatorios.
+6. Prioriza siempre asesorar y vender, no solo informar.
+7. Usa lenguaje claro, natural y profesional, ideal para WhatsApp.
+
+FORMA DE ATENDER:
+- Primero entiende la necesidad real del cliente.
+- Luego ofrece las mejores opciones disponibles.
+- Explica beneficios en lenguaje sencillo.
+- Incluye precios solo cuando los tengas confirmados.
+- Si hay varias opciones, preséntalas de forma clara y ordenada.
+
+SEGÚN CATEGORÍA:
+
+• Cerraduras digitales:
+Pregunta el uso (puerta principal, habitación, oficina, cajón, exterior).
+Explica tipo de acceso, nivel de seguridad y si es resistente al agua.
+
+• GPS para vehículos:
+Pregunta tipo de vehículo y necesidad (seguridad, rastreo, flota).
+Explica claramente la diferencia entre GPS normal y GPS con anti-inhibidor.
+
+• Repuestos de celulares:
+Guía al cliente aunque no sepa el modelo.
+Pregunta marca, modelo y problema.
+Aclara si incluye táctil o no.
+
+• Tiras LED para TV:
+Nunca asumas el modelo.
+Pregunta marca, pulgadas y modelo.
+Explica diferencias de calidad y durabilidad.
+
+• Intercomunicadores para moto:
+Pregunta si es para uno o dos cascos, distancia y tipo de uso.
+
+POLÍTICAS:
+Explica garantías, cambios y devoluciones de forma clara y conforme a la ley colombiana.
+Nunca prometas algo fuera de política.
+
+OBJETIVO FINAL:
+Asesorar como un vendedor experto de BK GLOBAL, generar confianza y cerrar la venta sin confundir al cliente.
+`.trim();
 
 /* =========================
    Helpers
@@ -81,7 +143,6 @@ function isGenericOptionsText(text = "") {
   return keys.some((k) => t.includes(k));
 }
 
-// ✅ NUEVO: detectar cuando piden SIN existencia
 function isNoStockRequest(text = "") {
   const t = norm(text);
   const keys = [
@@ -98,6 +159,32 @@ function isNoStockRequest(text = "") {
     "sin inventario",
   ];
   return keys.some((k) => t.includes(k));
+}
+
+/**
+ * ✅ IMPORTANTE:
+ * El cliente NO debe ver códigos/nombres internos.
+ * En Odoo suele venir "Nombre (CODIGO)" o "[CODIGO] Nombre".
+ * Esta función intenta "limpiar" para mostrar un nombre público más humano.
+ */
+function publicName(displayName = "") {
+  let s = String(displayName || "").trim();
+
+  // Quita cosas tipo "[ABC123]" al inicio
+  s = s.replace(/^\[[^\]]+\]\s*/g, "");
+
+  // Quita paréntesis al final que suelen ser códigos: "(ABC123)" "(12345)"
+  s = s.replace(/\s*\(([A-Za-z0-9\-\_\. ]{2,})\)\s*$/g, "").trim();
+
+  // Quita tokens muy "codigo": 4+ dígitos seguidos o mezcla alfanumérica rara
+  s = s.replace(/\b[A-Z]{2,}\d{2,}\b/g, "").replace(/\b\d{4,}\b/g, "").trim();
+
+  // Limpia espacios dobles
+  s = s.replace(/\s{2,}/g, " ").trim();
+
+  // Si quedó muy corto, devuélvelo como venía (mejor mostrar algo que nada)
+  if (s.length < 4) return String(displayName || "").trim();
+  return s;
 }
 
 /* =========================
@@ -183,7 +270,6 @@ async function odooFindProducts({ code = null, q = null, limit = 3 }) {
   return Array.isArray(products) ? products : [];
 }
 
-// ✅ más tolerante: ilike en vez de "="
 async function odooFindCategoryIdByName(name) {
   const domain = [["name", "ilike", String(name).trim()]];
   const rows = await odooExecuteKw("product.category", "search_read", [domain], {
@@ -256,10 +342,12 @@ function allowSuggestionsByCategoryName(catName = "") {
 function detectAdvisorCategoryFromNeed(text = "") {
   const t = norm(text);
 
+  // Cerraduras
   if (t.includes("cerradura") || t.includes("chapa") || t.includes("puerta")) {
     return "CERRADURAS DIGITALES";
   }
 
+  // Intercom
   if (t.includes("intercom") || t.includes("intercomunicador") || t.includes("moto") || t.includes("casco")) {
     return "INTERCOMUNICADORES";
   }
@@ -360,7 +448,7 @@ Reglas:
 
   const sess = session || {};
   const listed = Array.isArray(sess.lastOptions)
-    ? sess.lastOptions.map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code }))
+    ? sess.lastOptions.map((p, i) => ({ n: i + 1, nombre: p.display_name || "" }))
     : [];
 
   const user = `
@@ -379,18 +467,17 @@ SESSION:
 async function generateReplyWithOpenAI({ mode, userText, data, fallback }) {
   if (!OPENAI_API_KEY) return fallback;
 
+  // ✅ Tu prompt + reglas de salida estrictas JSON
   const sys = `
-Eres un asesor comercial por WhatsApp de BK GLOBAL (Colombia).
+${BK_SYSTEM_PROMPT}
 
-REGLAS CRÍTICAS:
-- NO inventes precio, existencia, productos o códigos.
-- Usa ÚNICAMENTE la info en DATA.
-- NUNCA muestres cantidades de stock. Solo:
-  "✅ Hay existencia" o "❌ Sin existencia"
-- NO pidas códigos ni nombres técnicos al cliente.
-- Si DATA trae "opciones", DEBES listar mínimo 3 opciones numeradas (1) 2) 3) con Precio y existencia.
+REGLAS TÉCNICAS (OBLIGATORIAS):
+- Usa ÚNICAMENTE la info que venga en DATA.
+- NUNCA muestres cantidades de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
+- Si DATA trae "opciones" u "opciones_sin_existencia", presenta las opciones numeradas (1), (2), (3)...
+- Si no hay opciones, haz 1-2 preguntas cortas para poder cotizar o verificar.
 - Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
-`;
+`.trim();
 
   const user = `
 MODE: ${mode}
@@ -400,11 +487,14 @@ ${JSON.stringify(data, null, 2)}
 `;
 
   try {
-    const obj = await openaiChatJSON({ system: sys, user, temperature: 0.3 });
+    const obj = await openaiChatJSON({ system: sys, user, temperature: 0.35 });
     const txt = obj?.reply && typeof obj.reply === "string" ? obj.reply.trim() : "";
 
-    // ✅ VALIDACIÓN: si debía listar opciones y no lo hizo, usamos fallback
-    if (data?.opciones?.length) {
+    // ✅ VALIDACIÓN: si venían opciones y OpenAI no listó, usamos fallback
+    const hasOptions = Array.isArray(data?.opciones) && data.opciones.length > 0;
+    const hasNoOptions = Array.isArray(data?.opciones_sin_existencia) && data.opciones_sin_existencia.length > 0;
+
+    if (hasOptions || hasNoOptions) {
       const hasNumbered = (/\b1\)|\b1\./.test(txt) && /\b2\)|\b2\./.test(txt));
       const mentionsPrice = /precio/i.test(txt) || /\$\d/.test(txt);
       if (!hasNumbered || !mentionsPrice) return fallback;
@@ -414,6 +504,7 @@ ${JSON.stringify(data, null, 2)}
   } catch (e) {
     console.error("⚠️ OpenAI reply error:", e.message || e);
   }
+
   return fallback;
 }
 
@@ -466,10 +557,11 @@ function seenBefore(msgId) {
 }
 
 /* =========================
-   ✅ ASESOR: mantiene contexto incluso sin stock
+   ✅ ASESOR (Cerraduras / Intercom)
+   - Mantiene contexto incluso sin stock
    - Si hay stock: lista 3-5 con existencia y permite elegir
    - Si NO hay stock: lista 3-5 sin existencia (con precio) y mantiene anchorCategory
-   - NO muestra códigos
+   - NO muestra códigos ni nombres internos (se limpia el nombre)
 ========================= */
 async function respondAdvisorOptions({ from, userText, categoryName, want = "AUTO" }) {
   const kw = buildNeedKeyword(userText);
@@ -495,7 +587,7 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
     const price = await odooGetPrice(p);
     enriched.push({
       id: p.id,
-      nombre: p.display_name,
+      nombre_publico: publicName(p.display_name),
       precio: moneyCOP(price),
       existencia: has ? "HAY" : "NO_HAY",
     });
@@ -512,17 +604,19 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
 
   const pregunta =
     categoryName === "CERRADURAS DIGITALES"
-      ? "¿La puerta es de madera o metálica? (y si es principal: ¿interior o exterior?)"
-      : "¿Lo quieres para 1 casco o 2 cascos?";
+      ? "¿Es para interior o exterior, y prefieres huella, clave o tarjeta?"
+      : "¿Lo quieres para 1 casco o 2 cascos, y tu uso es más ciudad o carretera?";
 
   // ✅ Con existencia
   if (showInStock && topIn.length) {
+    // lastOptions debe ser product.product original para que PICK funcione
     const topProducts = found.filter((p) => topIn.some((t) => t.id === p.id)).slice(0, topIn.length);
+
     sessions.set(from, { pending: "pick", lastOptions: topProducts, anchorCategory: categoryName });
 
     const fallback =
       `Perfecto 👌 Estas son opciones con EXISTENCIA ahora mismo:\n\n` +
-      topIn.map((o, i) => `${i + 1}) ${o.nombre}\nPrecio: ${o.precio}\n✅ Hay existencia`).join("\n\n") +
+      topIn.map((o, i) => `${i + 1}) ${o.nombre_publico}\nPrecio: ${o.precio}\n✅ Hay existencia`).join("\n\n") +
       `\n\n${pregunta}\nResponde con el número (1-${topIn.length}).`;
 
     const reply = await generateReplyWithOpenAI({
@@ -542,9 +636,9 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
 
     const fallback =
       `En este momento no tengo opciones con existencia en ${categoryName} 😕\n` +
-      `Pero manejo estos modelos (hoy están sin existencia):\n\n` +
-      topOut.map((o, i) => `${i + 1}) ${o.nombre}\nPrecio: ${o.precio}\n❌ Sin existencia`).join("\n\n") +
-      `\n\nSi me dices ${categoryName === "CERRADURAS DIGITALES" ? "si es interior o exterior y el tipo de acceso (huella/clave/tarjeta)" : "si es 1 o 2 cascos y tu uso (ciudad/carretera)"}, te digo cuál te conviene y te aviso opciones disponibles.`;
+      `Pero manejo estas opciones (hoy están sin existencia):\n\n` +
+      topOut.map((o, i) => `${i + 1}) ${o.nombre_publico}\nPrecio: ${o.precio}\n❌ Sin existencia`).join("\n\n") +
+      `\n\n${pregunta}`;
 
     const reply = await generateReplyWithOpenAI({
       mode: "ASESOR_SIN_EXISTENCIA",
@@ -629,7 +723,7 @@ app.post("/webhook", async (req, res) => {
         mode: "SALUDO",
         userText: text,
         data: { note: "Saluda y pregunta qué necesita." },
-        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (dime qué necesitas y te recomiendo opciones)",
+        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy?",
       });
 
       await sendWhatsAppText(from, reply);
@@ -639,7 +733,7 @@ app.post("/webhook", async (req, res) => {
     // Reset manual
     if (resets.has(tnorm)) {
       sessions.delete(from);
-      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas? (dime para qué lo quieres y te recomiendo opciones)");
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas?");
       return;
     }
 
@@ -667,7 +761,7 @@ app.post("/webhook", async (req, res) => {
     // Reset por OpenAI
     if (intentObj.intent === "RESET") {
       sessions.delete(from);
-      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas? (dime para qué lo quieres y te recomiendo opciones)");
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas?");
       return;
     }
 
@@ -705,7 +799,7 @@ app.post("/webhook", async (req, res) => {
         const alts = await odooSuggestAlternativesSameCategory({ product: chosen, limit: 3 });
         alternatives = await Promise.all(
           alts.map(async (p) => ({
-            nombre: p.display_name,
+            nombre_publico: publicName(p.display_name),
             precio: moneyCOP(await odooGetPrice(p)),
             existencia: "HAY",
           }))
@@ -714,7 +808,7 @@ app.post("/webhook", async (req, res) => {
 
       const safe = {
         producto: {
-          nombre: chosen.display_name,
+          nombre_publico: publicName(chosen.display_name),
           categoria: catName || null,
           precio: moneyCOP(price),
           existencia: has ? "HAY" : "NO_HAY",
@@ -723,12 +817,12 @@ app.post("/webhook", async (req, res) => {
       };
 
       const fallback =
-        `${safe.producto.nombre}\n` +
+        `${safe.producto.nombre_publico}\n` +
         `Precio: ${safe.producto.precio}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
         (alternatives.length
-          ? `\n\nTe recomiendo estas alternativas con existencia:\n` +
-            alternatives.map((a, i) => `${i + 1}) ${a.nombre} - ${a.precio}`).join("\n")
+          ? `\n\nAlternativas con existencia:\n` +
+            alternatives.map((a, i) => `${i + 1}) ${a.nombre_publico} - ${a.precio}`).join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -746,7 +840,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     /* =========================
-       ✅ MODO ASESOR
+       ✅ MODO ASESOR (Cerraduras / Intercom)
     ========================= */
     if (intentObj.intent === "SEARCH") {
       const advisorCat = detectAdvisorCategoryFromNeed(text);
@@ -758,6 +852,7 @@ app.post("/webhook", async (req, res) => {
 
     /* =========================
        Búsqueda normal (otros productos)
+       (aquí SÍ puede pedir datos al cliente porque no son cerraduras/intercom)
     ========================= */
     let products = [];
 
@@ -768,14 +863,14 @@ app.post("/webhook", async (req, res) => {
       const q = intentObj.query || text;
       products = await odooFindProducts({ q, limit: 3 });
     } else if (intentObj.intent === "ASK_CLARIFY") {
-      await sendWhatsAppText(from, "¿Me compartes el código o el nombre exacto del producto para revisarte precio y disponibilidad? 🙂");
+      await sendWhatsAppText(from, "¿Me compartes el nombre del producto o un detalle adicional (marca/modelo) para confirmarte precio y disponibilidad? 🙂");
       return;
     } else {
       products = await odooFindProducts({ q: text, limit: 3 });
     }
 
     if (!products.length) {
-      await sendWhatsAppText(from, "No lo encontré en Odoo. ¿Me envías el código o el nombre exacto? 🙏");
+      await sendWhatsAppText(from, "No lo encontré en Odoo. ¿Me das un detalle extra (marca/modelo) para verificar? 🙏");
       return;
     }
 
@@ -790,7 +885,7 @@ app.post("/webhook", async (req, res) => {
         const alts = await odooSuggestAlternativesSameCategory({ product: p, limit: 3 });
         alternatives = await Promise.all(
           alts.map(async (x) => ({
-            nombre: x.display_name,
+            nombre_publico: publicName(x.display_name),
             precio: moneyCOP(await odooGetPrice(x)),
             existencia: "HAY",
           }))
@@ -799,7 +894,7 @@ app.post("/webhook", async (req, res) => {
 
       const safe = {
         producto: {
-          nombre: p.display_name,
+          nombre_publico: publicName(p.display_name),
           precio: moneyCOP(price),
           existencia: has ? "HAY" : "NO_HAY",
         },
@@ -807,12 +902,12 @@ app.post("/webhook", async (req, res) => {
       };
 
       const fallback =
-        `${safe.producto.nombre}\n` +
+        `${safe.producto.nombre_publico}\n` +
         `Precio: ${safe.producto.precio}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
         (alternatives.length
-          ? `\n\nTe recomiendo estas alternativas con existencia:\n` +
-            alternatives.map((a, i) => `${i + 1}) ${a.nombre} - ${a.precio}`).join("\n")
+          ? `\n\nAlternativas con existencia:\n` +
+            alternatives.map((a, i) => `${i + 1}) ${a.nombre_publico} - ${a.precio}`).join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -832,12 +927,12 @@ app.post("/webhook", async (req, res) => {
 
     const opciones = products.map((p, i) => ({
       n: i + 1,
-      nombre: p.display_name,
+      nombre_publico: publicName(p.display_name),
     }));
 
     const fallback =
       `Encontré estas opciones:\n` +
-      opciones.map((o) => `${o.n}) ${o.nombre}`).join("\n") +
+      opciones.map((o) => `${o.n}) ${o.nombre_publico}`).join("\n") +
       `\n\n¿Cuál te interesa? (1, 2 o 3)`;
 
     const reply = await generateReplyWithOpenAI({
