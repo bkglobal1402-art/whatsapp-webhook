@@ -8,11 +8,19 @@ const app = express();
 app.use(express.json());
 
 /* =========================
-   ENV
+   ENV (Railway Variables)
 ========================= */
-const ODOO_URL = process.env.ODOO_URL;      // http://104.225.217.59:5033
-const ODOO_DB = process.env.ODOO_DB;        // odoo_admin_pro
-const ODOO_USER = process.env.ODOO_USER;    // bot@bkglobal.com.co
+// ODOO_URL: http://104.225.217.59:5033
+// ODOO_DB:  odoo_admin_pro
+// ODOO_USER: bot@bkglobal.com.co
+// ODOO_PASS: (tu clave del usuario bot)
+
+// VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
+// OPENAI_API_KEY (opcional OPENAI_MODEL)
+
+const ODOO_URL = process.env.ODOO_URL;
+const ODOO_DB = process.env.ODOO_DB;
+const ODOO_USER = process.env.ODOO_USER;
 const ODOO_PASS = process.env.ODOO_PASS;
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
@@ -111,15 +119,48 @@ async function odooExecuteKw(model, method, args = [], kwargs = {}) {
   });
 }
 
+/* =========================
+   Odoo Queries
+========================= */
 async function odooFindProducts({ code = null, q = null, limit = 3 }) {
   const domain = [];
   if (code) {
     domain.push(["default_code", "=", String(code).trim()]);
   } else if (q) {
     const qq = String(q).trim();
-    // Busca por nombre o por referencia
     domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
   } else return [];
+
+  const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
+  const products = await odooExecuteKw("product.product", "search_read", [domain], {
+    fields,
+    limit,
+    order: "id desc",
+  });
+
+  return Array.isArray(products) ? products : [];
+}
+
+async function odooFindCategoryIdByName(name) {
+  const domain = [["name", "=", name]];
+  const rows = await odooExecuteKw("product.category", "search_read", [domain], {
+    fields: ["id", "name"],
+    limit: 1,
+  });
+  return rows?.[0]?.id || null;
+}
+
+async function odooFindProductsByCategory({ categoryName, q = null, limit = 8 }) {
+  const catId = await odooFindCategoryIdByName(categoryName);
+  if (!catId) return [];
+
+  const domain = [["categ_id", "=", catId]];
+
+  if (q && String(q).trim()) {
+    const qq = String(q).trim();
+    // dentro de la categoría, ayuda a filtrar por texto
+    domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
+  }
 
   const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
@@ -156,27 +197,54 @@ async function odooGetPrice(product) {
   return isFinite(p) ? p : 0;
 }
 
-async function odooGetCategoryName(product) {
-  // categ_id normalmente viene como [id, "Nombre"]
+function getCategoryName(product) {
   const c = product?.categ_id;
   if (Array.isArray(c) && typeof c[1] === "string") return c[1];
   return "";
 }
 
+/* =========================
+   Category Rules (BK GLOBAL)
+========================= */
 function allowSuggestionsByCategoryName(catName = "") {
   const c = norm(catName);
-  // SOLO cerraduras e intercomunicadores
-  return c.includes("cerrad") || c.includes("intercom");
+  return c === "cerraduras digitales" || c === "intercomunicadores";
 }
 
-async function odooSuggestAlternatives({ product, limit = 3 }) {
-  // Alternativas dentro de la misma categoría (si existe)
+function detectAdvisorCategoryFromNeed(text = "") {
+  const t = norm(text);
+
+  // Cerraduras
+  if (t.includes("cerradura") || t.includes("chapa") || t.includes("puerta")) {
+    return "CERRADURAS DIGITALES";
+  }
+
+  // Intercom
+  if (t.includes("intercom") || t.includes("intercomunicador") || t.includes("moto") || t.includes("casco")) {
+    return "INTERCOMUNICADORES";
+  }
+
+  return null;
+}
+
+function buildNeedKeyword(text = "") {
+  const t = norm(text);
+  if (t.includes("principal")) return "principal";
+  if (t.includes("exterior")) return "exterior";
+  if (t.includes("interior")) return "interior";
+  if (t.includes("puerta")) return "puerta";
+  if (t.includes("moto")) return "moto";
+  if (t.includes("casco")) return "casco";
+  return "";
+}
+
+async function odooSuggestAlternativesSameCategory({ product, limit = 3 }) {
   const categ = product?.categ_id;
   const categId = Array.isArray(categ) ? categ[0] : null;
   if (!categId) return [];
 
-  // Traemos varios y filtramos los que tengan stock
   const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
+
   const candidates = await odooExecuteKw(
     "product.product",
     "search_read",
@@ -220,7 +288,6 @@ async function openaiChatJSON({ system, user, temperature = 0 }) {
   if (!resp.ok) throw new Error(`OpenAI HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 250)}`);
   const txt = data?.choices?.[0]?.message?.content?.trim() || "";
 
-  // Debe ser JSON
   try {
     return JSON.parse(txt);
   } catch {
@@ -278,8 +345,10 @@ REGLAS CRÍTICAS:
 - Usa ÚNICAMENTE la info en DATA.
 - NUNCA muestres cantidades de stock. Solo:
   "✅ Hay existencia" o "❌ Sin existencia"
-- Siempre amable, vendedor, pero corto (máx 6 líneas).
-- Si no hay stock y hay alternativas permitidas, sugiere 1 a 3 alternativas.
+- Siempre amable y vendedor, pero corto (máx 7 líneas).
+- Para CERRADURAS DIGITALES e INTERCOMUNICADORES:
+  - NO pidas código ni nombre técnico.
+  - Haz 2-3 preguntas máximo y ofrece 3 opciones.
 - Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
 `;
 
@@ -415,7 +484,7 @@ app.post("/webhook", async (req, res) => {
         mode: "SALUDO",
         userText: text,
         data: { note: "Saluda y pregunta qué necesita. Tono vendedor." },
-        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (puedes enviarme el código o el nombre del producto)",
+        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (puedes decirme qué necesitas y te recomiendo opciones)",
       });
       await sendWhatsAppText(from, reply);
       return;
@@ -424,7 +493,7 @@ app.post("/webhook", async (req, res) => {
     // Reset manual
     if (resets.has(tnorm)) {
       sessions.delete(from);
-      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando? (código o nombre)");
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas? (dime para qué lo quieres y te recomiendo opciones)");
       return;
     }
 
@@ -435,13 +504,16 @@ app.post("/webhook", async (req, res) => {
 
     if (intentObj.intent === "RESET") {
       sessions.delete(from);
-      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando? (código o nombre)");
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas? (dime para qué lo quieres y te recomiendo opciones)");
       return;
     }
 
     // Si estaban en selección 1/2/3
     if (sess.pending === "pick" || intentObj.intent === "PICK_OPTION") {
-      const n = intentObj.choice_number ?? (tnorm.match(/\b(1|2|3)\b/) ? Number(RegExp.$1) : null);
+      const n =
+        intentObj.choice_number ??
+        (tnorm.match(/\b(1|2|3)\b/) ? Number(RegExp.$1) : null);
+
       const idx = typeof n === "number" ? n - 1 : -1;
       const chosen = sess.lastOptions?.[idx];
 
@@ -449,7 +521,13 @@ app.post("/webhook", async (req, res) => {
         const reply = await generateReplyWithOpenAI({
           mode: "PEDIR_OPCION",
           userText: text,
-          data: { opciones: (sess.lastOptions || []).map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code })) },
+          data: {
+            opciones: (sess.lastOptions || []).map((p, i) => ({
+              n: i + 1,
+              nombre: p.display_name,
+              codigo: p.default_code,
+            })),
+          },
           fallback: "¿Cuál opción eliges? respóndeme con 1, 2 o 3 🙂",
         });
         await sendWhatsAppText(from, reply);
@@ -458,11 +536,11 @@ app.post("/webhook", async (req, res) => {
 
       const price = await odooGetPrice(chosen);
       const has = await odooHasStock(chosen.id);
-      const catName = await odooGetCategoryName(chosen);
+      const catName = getCategoryName(chosen);
 
       let alternatives = [];
       if (!has && allowSuggestionsByCategoryName(catName)) {
-        const alts = await odooSuggestAlternatives({ product: chosen, limit: 3 });
+        const alts = await odooSuggestAlternativesSameCategory({ product: chosen, limit: 3 });
         alternatives = await Promise.all(
           alts.map(async (p) => ({
             nombre: p.display_name,
@@ -488,8 +566,11 @@ app.post("/webhook", async (req, res) => {
         `${safe.producto.nombre}${safe.producto.codigo ? ` (${safe.producto.codigo})` : ""}\n` +
         `Precio: ${safe.producto.precio}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
-        (alternatives.length ? "\n\nTe puedo ofrecer estas alternativas con existencia:\n" +
-          alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
+        (alternatives.length
+          ? `\n\nSi quieres, te recomiendo estas alternativas con existencia:\n` +
+            alternatives
+              .map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`)
+              .join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -504,7 +585,97 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Buscar por código o query
+    /* =========================
+       ✅ MODO ASESOR (Cerraduras / Intercom)
+       - No pide códigos
+       - Busca por categoría en Odoo
+       - Pregunta 2-3 cosas
+       - Muestra 3 opciones
+    ========================= */
+    if (intentObj.intent === "SEARCH") {
+      const advisorCat = detectAdvisorCategoryFromNeed(text);
+
+      if (advisorCat === "CERRADURAS DIGITALES" || advisorCat === "INTERCOMUNICADORES") {
+        const kw = buildNeedKeyword(text);
+
+        // 1) intentar filtrar dentro de categoría con keyword
+        let found = await odooFindProductsByCategory({ categoryName: advisorCat, q: kw, limit: 10 });
+
+        // 2) si no encuentra, traer por categoría sola
+        if (!found.length) {
+          found = await odooFindProductsByCategory({ categoryName: advisorCat, q: null, limit: 10 });
+        }
+
+        if (!found.length) {
+          await sendWhatsAppText(
+            from,
+            `Hola 👋 En este momento no veo productos en la categoría ${advisorCat} en Odoo. ¿Me das un detalle extra (ej: huella/clave o 1 casco/2 cascos) y lo intento de nuevo?`
+          );
+          return;
+        }
+
+        // Enriquecer (priorizar stock)
+        const enriched = [];
+        for (const p of found) {
+          const has = await odooHasStock(p.id);
+          const price = await odooGetPrice(p);
+          enriched.push({
+            id: p.id,
+            nombre: p.display_name,
+            codigo: p.default_code || null,
+            precio: moneyCOP(price),
+            existencia: has ? "HAY" : "NO_HAY",
+          });
+        }
+
+        const top = [
+          ...enriched.filter((x) => x.existencia === "HAY"),
+          ...enriched.filter((x) => x.existencia !== "HAY"),
+        ].slice(0, 3);
+
+        // Guardar 3 opciones para 1/2/3
+        sessions.set(from, { pending: "pick", lastOptions: found.slice(0, 3) });
+
+        const preguntas =
+          advisorCat === "CERRADURAS DIGITALES"
+            ? [
+                "¿La puerta es de madera o metálica?",
+                "¿La quieres con huella, clave o tarjeta?",
+                "¿Es para interior o exterior?",
+              ]
+            : [
+                "¿Lo quieres para 1 casco o 2 cascos?",
+                "¿Prefieres gama básica o buena calidad de audio?",
+                "¿Tu uso es ciudad o carretera?",
+              ];
+
+        const reply = await generateReplyWithOpenAI({
+          mode: "ASESOR_BKGLOBAL",
+          userText: text,
+          data: { categoria: advisorCat, preguntas, opciones: top },
+          fallback:
+            `Perfecto 👌 Te asesoro.\n` +
+            preguntas.map((p, i) => `${i + 1}) ${p}`).join("\n") +
+            `\n\nOpciones que tengo:\n` +
+            top
+              .map(
+                (o, i) =>
+                  `${i + 1}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}\nPrecio: ${o.precio}\n${
+                    o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+                  }`
+              )
+              .join("\n\n") +
+            `\n\n¿Cuál te gusta más: 1, 2 o 3?`,
+        });
+
+        await sendWhatsAppText(from, reply);
+        return;
+      }
+    }
+
+    /* =========================
+       Búsqueda normal (otros productos)
+    ========================= */
     let products = [];
     if (intentObj.intent === "CODE_LOOKUP" || isLikelyCode(text)) {
       const code = intentObj.code || String(text).trim();
@@ -513,41 +684,39 @@ app.post("/webhook", async (req, res) => {
       const q = intentObj.query || text;
       products = await odooFindProducts({ q, limit: 3 });
     } else if (intentObj.intent === "ASK_CLARIFY") {
+      // En general: pedir aclaración (pero NO aplica a cerraduras/intercom por el bloque asesor)
       const reply = await generateReplyWithOpenAI({
         mode: "ACLARAR",
         userText: text,
-        data: { tips: ["Envíame el código si lo tienes (ej: 103317).", "O el nombre exacto (ej: display iphone 11 pro max)."] },
+        data: { tips: ["Envíame el código si lo tienes.", "O el nombre exacto como aparece en Odoo."] },
         fallback: "¿Me compartes el código o el nombre exacto del producto para revisarte precio y disponibilidad? 🙂",
       });
       await sendWhatsAppText(from, reply);
       return;
     } else {
-      // fallback búsqueda
       products = await odooFindProducts({ q: text, limit: 3 });
     }
 
-    // Sin coincidencias
     if (!products.length) {
       const reply = await generateReplyWithOpenAI({
         mode: "SIN_COINCIDENCIAS",
         userText: text,
-        data: { tips: ["Envíame el código del producto.", "O el nombre exacto como lo manejas en Odoo."] },
+        data: { tips: ["Envíame el código del producto.", "O el nombre exacto como aparece en Odoo."] },
         fallback: "No lo encontré en Odoo. ¿Me envías el código o el nombre exacto? 🙏",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Único producto
     if (products.length === 1) {
       const p = products[0];
       const price = await odooGetPrice(p);
       const has = await odooHasStock(p.id);
-      const catName = await odooGetCategoryName(p);
+      const catName = getCategoryName(p);
 
       let alternatives = [];
       if (!has && allowSuggestionsByCategoryName(catName)) {
-        const alts = await odooSuggestAlternatives({ product: p, limit: 3 });
+        const alts = await odooSuggestAlternativesSameCategory({ product: p, limit: 3 });
         alternatives = await Promise.all(
           alts.map(async (x) => ({
             nombre: x.display_name,
@@ -573,8 +742,11 @@ app.post("/webhook", async (req, res) => {
         `${safe.producto.nombre}${safe.producto.codigo ? ` (${safe.producto.codigo})` : ""}\n` +
         `Precio: ${safe.producto.precio}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
-        (alternatives.length ? "\n\nTe puedo ofrecer estas alternativas con existencia:\n" +
-          alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
+        (alternatives.length
+          ? `\n\nTe recomiendo estas alternativas con existencia:\n` +
+            alternatives
+              .map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`)
+              .join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -584,13 +756,12 @@ app.post("/webhook", async (req, res) => {
         fallback,
       });
 
-      // Guardar estado mínimo (por si pregunta “y la otra?”)
       sessions.set(from, { pending: null, lastOptions: [p] });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Múltiples: lista y pedir elección
+    // múltiples: lista y pedir elección
     sessions.set(from, { pending: "pick", lastOptions: products });
 
     const opciones = products.map((p, i) => ({
