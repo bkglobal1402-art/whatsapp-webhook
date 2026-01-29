@@ -11,15 +11,6 @@ app.use(express.json());
 /* =========================
    ENV (Railway Variables)
 ========================= */
-// ODOO_URL: http://104.225.217.59:5033
-// ODOO_DB:  odoo_admin_pro
-// ODOO_USER: bot@bkglobal.com.co
-// ODOO_PASS: (tu clave del usuario bot)
-//
-// VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
-// OPENAI_API_KEY (obligatorio)
-// OPENAI_MODEL (opcional) ej: gpt-4o-mini, gpt-4.1-mini, etc.
-
 const ODOO_URL = process.env.ODOO_URL;
 const ODOO_DB = process.env.ODOO_DB;
 const ODOO_USER = process.env.ODOO_USER;
@@ -32,11 +23,8 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// límites
 const OPTIONS_LIMIT = Number(process.env.OPTIONS_LIMIT || 12);
 const MAX_TOOL_LOOPS = Number(process.env.MAX_TOOL_LOOPS || 4);
-
-// logs detallados (si quieres apagar, pon DEBUG=false)
 const DEBUG = String(process.env.DEBUG || "true").toLowerCase() !== "false";
 
 function dlog(...args) {
@@ -46,7 +34,6 @@ function dlog(...args) {
 if (!OPENAI_API_KEY) {
   console.warn("⚠️ Falta OPENAI_API_KEY. El bot seguirá, pero sin IA no hará tool-calling.");
 }
-
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 /* =========================
@@ -91,10 +78,10 @@ function truncateWhatsApp(text, max = 1600) {
 }
 
 function shortToolResult(result) {
-  // evita llenar logs con listas enormes
   if (!result || typeof result !== "object") return result;
   const r = { ...result };
   if (Array.isArray(r.items)) {
+    r.items_total = r.items.length;
     r.items = r.items.slice(0, 3).map((x) => ({
       name: x.name,
       code: x.code,
@@ -103,7 +90,6 @@ function shortToolResult(result) {
       category: x.category,
     }));
     r.items_preview = true;
-    r.items_total = result.items.length;
   }
   return r;
 }
@@ -184,7 +170,6 @@ async function odooFindCategoryIdByName(name) {
 async function odooSearchProducts({ q, limit = 10 }) {
   const qq = String(q || "").trim();
   if (!qq) return [];
-
   const domain = ["|", ["name", "ilike", qq], ["default_code", "ilike", qq]];
   const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
@@ -278,7 +263,7 @@ async function sendWhatsAppText(to, text) {
    Sessions + Dedup
 ========================= */
 const sessions = new Map(); // from -> { inputItems: [], lastCategory: string|null }
-const seenMsg = new Map();  // msgId -> ts
+const seenMsg = new Map();
 const SEEN_TTL = 10 * 60 * 1000;
 
 function seenBefore(msgId) {
@@ -293,9 +278,7 @@ function seenBefore(msgId) {
 }
 
 function getSession(from) {
-  if (!sessions.has(from)) {
-    sessions.set(from, { inputItems: [], lastCategory: null });
-  }
+  if (!sessions.has(from)) sessions.set(from, { inputItems: [], lastCategory: null });
   return sessions.get(from);
 }
 
@@ -304,67 +287,42 @@ function resetSession(from) {
 }
 
 /* =========================
-   BK GLOBAL Prompt
+   Prompt
 ========================= */
 const BK_PROMPT = `
 Eres BK GLOBAL IA, el asesor comercial y técnico oficial de BK GLOBAL S.A.S (Colombia).
+No inventes nada. Usa SOLO la info de herramientas.
 
-BK GLOBAL se dedica a la venta de:
-- Repuestos de celulares y tablets
-- Cerraduras digitales
-- GPS para vehículos (incluyendo modelos con anti-inhibidor)
-- Intercomunicadores para moto
-- Tiras LED para televisores
-- Accesorios tecnológicos
+Cuando pidan opciones: lista productos con y sin existencia.
+- Muestra código (como viene de Odoo) y precio si existe.
+- No muestres cantidades de stock: solo ✅ Hay / ❌ No hay.
 
-Tu comportamiento debe ser el de un asesor humano experto, cercano y confiable.
+Si preguntan "¿para cuándo llegan?" y NO hay ETA real:
+- di que no hay fecha confirmada en sistema
+- ofrece verificar
+- ofrece alternativas disponibles si aplica
 
-REGLAS CLAVE:
-1) No inventes productos, precios, compatibilidades, tiempos de llegada ni disponibilidad.
-2) Usa SOLO la información que obtengas mediante las herramientas (tools).
-3) Si no tienes información exacta (ej: fecha de llegada), dilo claro y ofrece verificar.
-4) Haz preguntas cortas y necesarias, no interrogatorios.
-5) Prioriza asesorar y vender, no solo informar.
-6) Lenguaje claro, natural y profesional, ideal para WhatsApp.
-
-MOSTRAR OPCIONES:
-- Cuando el usuario pida "opciones", "qué tienes", "muéstrame", etc:
-  - Lista opciones del catálogo (con y sin existencia).
-  - Debes mostrar el *código* del producto (tal cual viene de Odoo).
-  - Nunca muestres cantidades de stock; solo "✅ Hay" o "❌ No hay".
-  - Incluye precio SOLO si la herramienta lo trae (list_price de Odoo).
-
-CONVERSACIÓN / CONTEXTO:
-- Si el usuario pregunta "¿para cuándo llegan?" y NO existe ETA real,
-  responde coherente: "no tengo fecha confirmada en este momento" + ofrece verificar
-  + ofrece alternativas disponibles en existencia si el usuario está comprando.
-
-FORMATO:
-- Respuestas cortas (ideal 6-12 líneas).
-- Si hay lista, usa numeración/viñetas claras.
-
-IMPORTANTE:
-- Las herramientas son la única fuente de verdad.
+Respuestas cortas tipo WhatsApp (6-12 líneas).
 `;
 
 /* =========================
-   Tools (Function Calling)
+   Tools (STRICT FIXED)
 ========================= */
 const tools = [
   {
     type: "function",
     name: "list_products_by_category",
-    description:
-      "Lista productos por categoría desde Odoo, incluyendo precio, código y si hay existencia (sin cantidades).",
+    description: "Lista productos por categoría desde Odoo con precio, código y existencia (sin cantidades).",
     parameters: {
       type: "object",
       properties: {
-        category_name: { type: "string", description: "Nombre exacto de la categoría en Odoo, ej: CERRADURAS DIGITALES" },
-        query: { type: "string", description: "Filtro opcional (texto) para refinar dentro de la categoría" },
-        availability: { type: "string", enum: ["any", "in_stock", "out_of_stock"], description: "Filtra por existencia" },
+        category_name: { type: "string", description: "Nombre exacto de la categoría en Odoo. Ej: CERRADURAS DIGITALES" },
+        query: { type: ["string", "null"], description: "Filtro opcional dentro de la categoría. Si no hay, usa null." },
+        availability: { type: "string", enum: ["any", "in_stock", "out_of_stock"], description: "Filtro de existencia" },
         limit: { type: "integer", description: "Máximo de productos a retornar" },
       },
-      required: ["category_name"],
+      // ✅ strict=true requiere que required incluya TODAS las keys
+      required: ["category_name", "query", "availability", "limit"],
       additionalProperties: false,
     },
     strict: true,
@@ -372,15 +330,14 @@ const tools = [
   {
     type: "function",
     name: "search_products",
-    description:
-      "Busca productos en todo el catálogo Odoo por texto (nombre o código), devolviendo precio, código y existencia (sin cantidades).",
+    description: "Busca productos en todo Odoo por texto, devolviendo precio, código y existencia (sin cantidades).",
     parameters: {
       type: "object",
       properties: {
         query: { type: "string", description: "Texto de búsqueda" },
         limit: { type: "integer", description: "Máximo de productos a retornar" },
       },
-      required: ["query"],
+      required: ["query", "limit"],
       additionalProperties: false,
     },
     strict: true,
@@ -388,15 +345,14 @@ const tools = [
   {
     type: "function",
     name: "get_restock_eta",
-    description:
-      "Devuelve información de fecha estimada de llegada (ETA) si existe. Si no existe, devuelve unknown coherente.",
+    description: "Devuelve ETA si existe; si no, devuelve unknown coherente.",
     parameters: {
       type: "object",
       properties: {
-        category_name: { type: "string", description: "Categoría del producto" },
-        product_code: { type: "string", description: "Código Odoo del producto (si se tiene)" },
+        category_name: { type: ["string", "null"], description: "Categoría (si se sabe) o null" },
+        product_code: { type: ["string", "null"], description: "Código Odoo (si se sabe) o null" },
       },
-      required: [],
+      required: ["category_name", "product_code"],
       additionalProperties: false,
     },
     strict: true,
@@ -408,13 +364,12 @@ const tools = [
 ========================= */
 async function tool_list_products_by_category(args, sess) {
   const category_name = String(args?.category_name || "").trim();
-  const query = String(args?.query || "").trim() || null;
-  const availability = args?.availability || "any";
+  const query = args?.query === null ? null : String(args?.query || "").trim() || null;
+  const availability = String(args?.availability || "any");
   const limit = Number(args?.limit || OPTIONS_LIMIT);
 
   if (!category_name) return { ok: false, error: "category_name vacío" };
 
-  // guardar ancla
   sess.lastCategory = category_name;
 
   const products = await odooSearchProductsByCategory({
@@ -423,7 +378,7 @@ async function tool_list_products_by_category(args, sess) {
     limit: Math.min(Math.max(limit, 1), 60),
   });
 
-  if (!products.length) return { ok: true, category_name, items: [] };
+  if (!products.length) return { ok: true, category_name, count: 0, items: [] };
 
   const ids = products.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
@@ -458,7 +413,7 @@ async function tool_search_products(args, sess) {
   if (!query) return { ok: false, error: "query vacío" };
 
   const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit, 1), 60) });
-  if (!products.length) return { ok: true, items: [] };
+  if (!products.length) return { ok: true, count: 0, items: [] };
 
   const ids = products.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
@@ -483,17 +438,17 @@ async function tool_search_products(args, sess) {
 }
 
 async function tool_get_restock_eta(args, sess) {
-  const category_name = String(args?.category_name || sess.lastCategory || "").trim() || null;
-  const product_code = String(args?.product_code || "").trim() || null;
+  const category_name =
+    args?.category_name === null ? null : String(args?.category_name || sess.lastCategory || "").trim() || null;
+  const product_code =
+    args?.product_code === null ? null : String(args?.product_code || "").trim() || null;
 
-  // Sin ETA real todavía
   return {
     ok: true,
     known: false,
     category_name,
     product_code,
-    message:
-      "No hay una fecha de llegada registrada en el sistema en este momento. Se puede verificar con compras/proveedor.",
+    message: "No hay una fecha de llegada registrada en el sistema en este momento. Se puede verificar con compras/proveedor.",
   };
 }
 
@@ -508,50 +463,46 @@ async function callToolByName(name, args, sess) {
    OpenAI Agent Loop (Responses API)
 ========================= */
 async function runAgent({ from, userText }) {
-  if (!openai) {
-    return "Hola 👋 En este momento no tengo IA activa (falta OPENAI_API_KEY). ¿Qué producto buscas?";
-  }
+  if (!openai) return "Hola 👋 En este momento no tengo IA activa (falta OPENAI_API_KEY). ¿Qué producto buscas?";
 
   const sess = getSession(from);
-
-  // push user message
   sess.inputItems.push({ role: "user", content: userText });
   if (sess.inputItems.length > 40) sess.inputItems = sess.inputItems.slice(-40);
 
-  let response;
   for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
     dlog(`🧠 Agent loop ${i + 1}/${MAX_TOOL_LOOPS} | model=${OPENAI_MODEL}`);
 
-    response = await openai.responses.create({
-      model: OPENAI_MODEL,
-      instructions: BK_PROMPT,
-      tools,
-      input: sess.inputItems,
-    });
+    let response;
+    try {
+      response = await openai.responses.create({
+        model: OPENAI_MODEL,
+        instructions: BK_PROMPT,
+        tools,
+        input: sess.inputItems,
+      });
+    } catch (e) {
+      console.error("❌ OpenAI responses.create error:", e?.message || e);
+      return "Tuve un problema consultando el asistente. ¿Me repites tu mensaje en una línea, por favor?";
+    }
 
-    // guardar output items en sesión
     if (Array.isArray(response.output) && response.output.length) {
       sess.inputItems.push(...response.output);
       if (sess.inputItems.length > 60) sess.inputItems = sess.inputItems.slice(-60);
     }
 
     const toolCalls = (response.output || []).filter((it) => it.type === "function_call");
-    if (toolCalls.length) {
-      // LOG tool calls
-      dlog(
-        "🧰 toolCalls:",
-        toolCalls.map((t) => ({ name: t.name, arguments: t.arguments }))
-      );
-    } else {
-      // respuesta final
+    if (!toolCalls.length) {
       const out = (response.output_text || "").trim();
       const finalText = out || "Listo 👍 ¿Me confirmas qué estás buscando exactamente para recomendarte opciones?";
-
       dlog("🤖 Reply to user:", finalText);
       return finalText;
     }
 
-    // ejecutar tool calls y devolver outputs
+    dlog(
+      "🧰 toolCalls:",
+      toolCalls.map((t) => ({ name: t.name, arguments: t.arguments }))
+    );
+
     for (const tc of toolCalls) {
       let args = {};
       try {
@@ -561,7 +512,6 @@ async function runAgent({ from, userText }) {
       }
 
       const result = await callToolByName(tc.name, args, sess);
-
       dlog("🧰 toolResult:", tc.name, shortToolResult(result));
 
       sess.inputItems.push({
@@ -575,7 +525,7 @@ async function runAgent({ from, userText }) {
   }
 
   const fallback =
-    "Estoy revisando opciones, pero necesito un detalle adicional para afinar. ¿Es para interior o exterior, y prefieres huella o clave?";
+    "Estoy revisando opciones, pero necesito un detalle adicional para afinar. ¿Es para interior o exterior y prefieres huella o clave?";
   dlog("🤖 Reply to user (max loops reached):", fallback);
   return fallback;
 }
@@ -629,7 +579,6 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  // responder rápido a Meta
   res.sendStatus(200);
 
   try {
@@ -656,7 +605,8 @@ app.post("/webhook", async (req, res) => {
 
     if (isGreeting(text)) {
       resetSession(from);
-      const hi = "¡Hola! 😄 Soy BK GLOBAL IA. ¿Qué necesitas hoy? (ej: cerradura para puerta principal, GPS, repuesto, tira LED, intercom)";
+      const hi =
+        "¡Hola! 😄 Soy BK GLOBAL IA. ¿Qué necesitas hoy? (ej: cerradura para puerta principal, GPS, repuesto, tira LED, intercom)";
       dlog("🤖 Reply to user:", hi);
       await sendWhatsAppText(from, hi);
       return;
@@ -671,7 +621,6 @@ app.post("/webhook", async (req, res) => {
     }
 
     const reply = await runAgent({ from, userText: text });
-
     dlog("🤖 Reply to user (final):", reply);
     await sendWhatsAppText(from, reply);
   } catch (err) {
