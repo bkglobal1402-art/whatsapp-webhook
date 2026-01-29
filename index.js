@@ -14,9 +14,9 @@ app.use(express.json());
 // ODOO_DB:  odoo_admin_pro
 // ODOO_USER: bot@bkglobal.com.co
 // ODOO_PASS: (tu clave del usuario bot)
-
+//
 // VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
-// OPENAI_API_KEY (opcional OPENAI_MODEL)
+// OPENAI_API_KEY (opcional) + OPENAI_MODEL (opcional)
 
 const ODOO_URL = process.env.ODOO_URL;
 const ODOO_DB = process.env.ODOO_DB;
@@ -56,6 +56,26 @@ function moneyCOP(n) {
   const x = Math.round(Number(n || 0));
   if (!isFinite(x)) return "$0";
   return `$${x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
+}
+
+function isGenericOptionsText(text = "") {
+  const t = norm(text);
+  const keys = [
+    "que opciones tienes",
+    "que opciones hay",
+    "que tienes",
+    "cuales tienes",
+    "cuales hay",
+    "en existencia",
+    "disponibles",
+    "con existencia",
+    "muestrame opciones",
+    "muestra opciones",
+    "opciones",
+    "disponible",
+    "existencia",
+  ];
+  return keys.some((k) => t.includes(k));
 }
 
 /* =========================
@@ -150,7 +170,7 @@ async function odooFindCategoryIdByName(name) {
   return rows?.[0]?.id || null;
 }
 
-async function odooFindProductsByCategory({ categoryName, q = null, limit = 8 }) {
+async function odooFindProductsByCategory({ categoryName, q = null, limit = 10 }) {
   const catId = await odooFindCategoryIdByName(categoryName);
   if (!catId) return [];
 
@@ -158,7 +178,6 @@ async function odooFindProductsByCategory({ categoryName, q = null, limit = 8 })
 
   if (q && String(q).trim()) {
     const qq = String(q).trim();
-    // dentro de la categoría, ayuda a filtrar por texto
     domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
   }
 
@@ -244,7 +263,6 @@ async function odooSuggestAlternativesSameCategory({ product, limit = 3 }) {
   if (!categId) return [];
 
   const fields = ["id", "display_name", "default_code", "list_price", "categ_id"];
-
   const candidates = await odooExecuteKw(
     "product.product",
     "search_read",
@@ -263,7 +281,7 @@ async function odooSuggestAlternativesSameCategory({ product, limit = 3 }) {
 }
 
 /* =========================
-   OpenAI
+   OpenAI (opcional)
 ========================= */
 async function openaiChatJSON({ system, user, temperature = 0 }) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -312,7 +330,7 @@ Devuelve SOLO JSON válido:
 
 Reglas:
 - Saludos (hola/buenas/hey) => GREETING
-- Reset (reiniciar/cancelar/empezar/reset) => RESET
+- Reset (reiniciar/cancelar/empezar/reset/borrar) => RESET
 - Si dice 1/2/3 o "la 2" => PICK_OPTION
 - Si texto es número >=4 dígitos => CODE_LOOKUP
 - Si es búsqueda por texto => SEARCH y query (limpia)
@@ -328,6 +346,7 @@ Reglas:
 USER_TEXT: ${userText}
 SESSION:
 - pending: ${sess.pending || "null"}
+- anchorCategory: ${sess.anchorCategory || "null"}
 - listed_options: ${JSON.stringify(listed)}
 `;
 
@@ -337,6 +356,9 @@ SESSION:
 }
 
 async function generateReplyWithOpenAI({ mode, userText, data, fallback }) {
+  // Si no hay OpenAI, usamos fallback siempre
+  if (!OPENAI_API_KEY) return fallback;
+
   const sys = `
 Eres un asesor comercial VENDEDOR por WhatsApp de BK GLOBAL (Colombia).
 
@@ -345,7 +367,7 @@ REGLAS CRÍTICAS:
 - Usa ÚNICAMENTE la info en DATA.
 - NUNCA muestres cantidades de stock. Solo:
   "✅ Hay existencia" o "❌ Sin existencia"
-- Siempre amable y vendedor, pero corto (máx 7 líneas).
+- Corto (máx 7 líneas).
 - Para CERRADURAS DIGITALES e INTERCOMUNICADORES:
   - NO pidas código ni nombre técnico.
   - Haz 2-3 preguntas máximo y ofrece 3 opciones.
@@ -399,9 +421,9 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   Session + Dedup (Meta Test Number fix)
+   Session + Dedup
 ========================= */
-const sessions = new Map(); // from -> { pending, lastOptions }
+const sessions = new Map(); // from -> { pending, lastOptions, anchorCategory }
 const seenMsg = new Map();  // msgId -> ts
 const SEEN_TTL = 10 * 60 * 1000;
 
@@ -414,6 +436,70 @@ function seenBefore(msgId) {
   if (seenMsg.has(msgId)) return true;
   seenMsg.set(msgId, now);
   return false;
+}
+
+/* =========================
+   Reusable: responder opciones por categoría (ancla)
+========================= */
+async function respondAdvisorOptions({ from, userText, categoryName }) {
+  const kw = buildNeedKeyword(userText);
+
+  let found = await odooFindProductsByCategory({ categoryName, q: kw, limit: 10 });
+  if (!found.length) found = await odooFindProductsByCategory({ categoryName, q: null, limit: 10 });
+
+  if (!found.length) {
+    await sendWhatsAppText(
+      from,
+      `Hola 👋 En este momento no veo productos en la categoría ${categoryName} en Odoo. ¿Me das un detalle extra y lo intento de nuevo?`
+    );
+    return;
+  }
+
+  const enriched = [];
+  for (const p of found) {
+    const has = await odooHasStock(p.id);
+    const price = await odooGetPrice(p);
+    enriched.push({
+      id: p.id,
+      nombre: p.display_name,
+      codigo: p.default_code || null,
+      precio: moneyCOP(price),
+      existencia: has ? "HAY" : "NO_HAY",
+    });
+  }
+
+  const top = [
+    ...enriched.filter((x) => x.existencia === "HAY"),
+    ...enriched.filter((x) => x.existencia !== "HAY"),
+  ].slice(0, 3);
+
+  sessions.set(from, { pending: "pick", lastOptions: found.slice(0, 3), anchorCategory: categoryName });
+
+  const preguntas =
+    categoryName === "CERRADURAS DIGITALES"
+      ? ["¿La puerta es de madera o metálica?", "¿La quieres con huella, clave o tarjeta?", "¿Es para interior o exterior?"]
+      : ["¿Lo quieres para 1 casco o 2 cascos?", "¿Prefieres gama básica o buena calidad de audio?", "¿Tu uso es ciudad o carretera?"];
+
+  const fallback =
+    `Perfecto 👌 Te asesoro.\n` +
+    preguntas.slice(0, 3).map((p, i) => `${i + 1}) ${p}`).join("\n") +
+    `\n\nOpciones que tengo:\n` +
+    top
+      .map(
+        (o, i) =>
+          `${i + 1}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}\nPrecio: ${o.precio}\n${o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`
+      )
+      .join("\n\n") +
+    `\n\n¿Cuál te gusta más: 1, 2 o 3?`;
+
+  const reply = await generateReplyWithOpenAI({
+    mode: "ASESOR_BKGLOBAL",
+    userText,
+    data: { categoria: categoryName, preguntas, opciones: top },
+    fallback,
+  });
+
+  await sendWhatsAppText(from, reply);
 }
 
 /* =========================
@@ -432,6 +518,7 @@ app.get("/test-odoo", async (req, res) => {
 
 app.get("/test-openai", async (req, res) => {
   try {
+    if (!OPENAI_API_KEY) return res.json({ ok: false, error: "Missing OPENAI_API_KEY" });
     const obj = await classifyIntentWithOpenAI({ userText: "hola", session: {} });
     res.json({ ok: true, sample: obj });
   } catch (e) {
@@ -465,7 +552,6 @@ app.post("/webhook", async (req, res) => {
 
     if (!from || !text) return;
 
-    // Dedup (Meta test number reenvía)
     if (seenBefore(msgId)) {
       console.log("🔁 Duplicate message ignored:", msgId);
       return;
@@ -477,15 +563,17 @@ app.post("/webhook", async (req, res) => {
     const greetings = new Set(["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey"]);
     const resets = new Set(["reiniciar", "reset", "cancelar", "empezar", "borrar"]);
 
-    // ✅ Regla 1: Siempre saludar si dicen hola (y resetear contexto)
+    // ✅ Saludo = reset de sesión
     if (greetings.has(tnorm)) {
       sessions.delete(from);
+
       const reply = await generateReplyWithOpenAI({
         mode: "SALUDO",
         userText: text,
-        data: { note: "Saluda y pregunta qué necesita. Tono vendedor." },
-        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (puedes decirme qué necesitas y te recomiendo opciones)",
+        data: { note: "Saluda y pregunta qué necesita." },
+        fallback: "Hola 👋 ¡Con gusto! ¿Qué estás buscando hoy? (dime qué necesitas y te recomiendo opciones)",
       });
+
       await sendWhatsAppText(from, reply);
       return;
     }
@@ -497,23 +585,46 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    const sess = sessions.get(from) || { pending: null, lastOptions: [] };
+    // Obtener sesión
+    const sess = sessions.get(from) || { pending: null, lastOptions: [], anchorCategory: null };
 
-    // OpenAI: intención
-    const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
+    // ✅ CLASIFICADOR: si no tienes OpenAI, usamos regla básica
+    let intentObj;
+    if (OPENAI_API_KEY) {
+      intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
+    } else {
+      // fallback simple
+      intentObj = { intent: "SEARCH", choice_number: null, code: null, query: text };
+      if (isLikelyCode(text)) intentObj = { intent: "CODE_LOOKUP", choice_number: null, code: String(text).trim(), query: null };
+      const justNumber = String(text || "").trim();
+      if (["1", "2", "3"].includes(justNumber)) intentObj = { intent: "PICK_OPTION", choice_number: Number(justNumber), code: null, query: null };
+    }
 
+    // ✅ HARD ANCHOR: si hay lista activa, "1/2/3" SIEMPRE es elección (aunque OpenAI se equivoque)
+    const justNumber = String(text || "").trim();
+    if (Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0 && ["1", "2", "3"].includes(justNumber)) {
+      intentObj.intent = "PICK_OPTION";
+      intentObj.choice_number = Number(justNumber);
+    }
+
+    // Reset por OpenAI
     if (intentObj.intent === "RESET") {
       sessions.delete(from);
       await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué necesitas? (dime para qué lo quieres y te recomiendo opciones)");
       return;
     }
 
-    // Si estaban en selección 1/2/3
-    if (sess.pending === "pick" || intentObj.intent === "PICK_OPTION") {
-      const n =
-        intentObj.choice_number ??
-        (tnorm.match(/\b(1|2|3)\b/) ? Number(RegExp.$1) : null);
+    // ✅ Si hay anchorCategory y el usuario pide "opciones / existencia / disponibles", NO CAMBIAR TEMA
+    if (sess.anchorCategory && isGenericOptionsText(text) && !isLikelyCode(text)) {
+      await respondAdvisorOptions({ from, userText: text, categoryName: sess.anchorCategory });
+      return;
+    }
 
+    /* =========================
+       Selección 1/2/3 (PICK)
+    ========================= */
+    if (sess.pending === "pick" || intentObj.intent === "PICK_OPTION") {
+      const n = intentObj.choice_number ?? null;
       const idx = typeof n === "number" ? n - 1 : -1;
       const chosen = sess.lastOptions?.[idx];
 
@@ -522,11 +633,7 @@ app.post("/webhook", async (req, res) => {
           mode: "PEDIR_OPCION",
           userText: text,
           data: {
-            opciones: (sess.lastOptions || []).map((p, i) => ({
-              n: i + 1,
-              nombre: p.display_name,
-              codigo: p.default_code,
-            })),
+            opciones: (sess.lastOptions || []).map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code })),
           },
           fallback: "¿Cuál opción eliges? respóndeme con 1, 2 o 3 🙂",
         });
@@ -567,10 +674,8 @@ app.post("/webhook", async (req, res) => {
         `Precio: ${safe.producto.precio}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
         (alternatives.length
-          ? `\n\nSi quieres, te recomiendo estas alternativas con existencia:\n` +
-            alternatives
-              .map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`)
-              .join("\n")
+          ? `\n\nTe recomiendo estas alternativas con existencia:\n` +
+            alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -580,7 +685,9 @@ app.post("/webhook", async (req, res) => {
         fallback,
       });
 
-      sessions.delete(from);
+      // Mantener ancla si sigue conversando del mismo tema (no borramos anchorCategory)
+      sessions.set(from, { pending: null, lastOptions: [], anchorCategory: sess.anchorCategory || null });
+
       await sendWhatsAppText(from, reply);
       return;
     }
@@ -596,79 +703,7 @@ app.post("/webhook", async (req, res) => {
       const advisorCat = detectAdvisorCategoryFromNeed(text);
 
       if (advisorCat === "CERRADURAS DIGITALES" || advisorCat === "INTERCOMUNICADORES") {
-        const kw = buildNeedKeyword(text);
-
-        // 1) intentar filtrar dentro de categoría con keyword
-        let found = await odooFindProductsByCategory({ categoryName: advisorCat, q: kw, limit: 10 });
-
-        // 2) si no encuentra, traer por categoría sola
-        if (!found.length) {
-          found = await odooFindProductsByCategory({ categoryName: advisorCat, q: null, limit: 10 });
-        }
-
-        if (!found.length) {
-          await sendWhatsAppText(
-            from,
-            `Hola 👋 En este momento no veo productos en la categoría ${advisorCat} en Odoo. ¿Me das un detalle extra (ej: huella/clave o 1 casco/2 cascos) y lo intento de nuevo?`
-          );
-          return;
-        }
-
-        // Enriquecer (priorizar stock)
-        const enriched = [];
-        for (const p of found) {
-          const has = await odooHasStock(p.id);
-          const price = await odooGetPrice(p);
-          enriched.push({
-            id: p.id,
-            nombre: p.display_name,
-            codigo: p.default_code || null,
-            precio: moneyCOP(price),
-            existencia: has ? "HAY" : "NO_HAY",
-          });
-        }
-
-        const top = [
-          ...enriched.filter((x) => x.existencia === "HAY"),
-          ...enriched.filter((x) => x.existencia !== "HAY"),
-        ].slice(0, 3);
-
-        // Guardar 3 opciones para 1/2/3
-        sessions.set(from, { pending: "pick", lastOptions: found.slice(0, 3) });
-
-        const preguntas =
-          advisorCat === "CERRADURAS DIGITALES"
-            ? [
-                "¿La puerta es de madera o metálica?",
-                "¿La quieres con huella, clave o tarjeta?",
-                "¿Es para interior o exterior?",
-              ]
-            : [
-                "¿Lo quieres para 1 casco o 2 cascos?",
-                "¿Prefieres gama básica o buena calidad de audio?",
-                "¿Tu uso es ciudad o carretera?",
-              ];
-
-        const reply = await generateReplyWithOpenAI({
-          mode: "ASESOR_BKGLOBAL",
-          userText: text,
-          data: { categoria: advisorCat, preguntas, opciones: top },
-          fallback:
-            `Perfecto 👌 Te asesoro.\n` +
-            preguntas.map((p, i) => `${i + 1}) ${p}`).join("\n") +
-            `\n\nOpciones que tengo:\n` +
-            top
-              .map(
-                (o, i) =>
-                  `${i + 1}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}\nPrecio: ${o.precio}\n${
-                    o.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
-                  }`
-              )
-              .join("\n\n") +
-            `\n\n¿Cuál te gusta más: 1, 2 o 3?`,
-        });
-
-        await sendWhatsAppText(from, reply);
+        await respondAdvisorOptions({ from, userText: text, categoryName: advisorCat });
         return;
       }
     }
@@ -677,6 +712,7 @@ app.post("/webhook", async (req, res) => {
        Búsqueda normal (otros productos)
     ========================= */
     let products = [];
+
     if (intentObj.intent === "CODE_LOOKUP" || isLikelyCode(text)) {
       const code = intentObj.code || String(text).trim();
       products = await odooFindProducts({ code, limit: 3 });
@@ -684,7 +720,6 @@ app.post("/webhook", async (req, res) => {
       const q = intentObj.query || text;
       products = await odooFindProducts({ q, limit: 3 });
     } else if (intentObj.intent === "ASK_CLARIFY") {
-      // En general: pedir aclaración (pero NO aplica a cerraduras/intercom por el bloque asesor)
       const reply = await generateReplyWithOpenAI({
         mode: "ACLARAR",
         userText: text,
@@ -744,9 +779,7 @@ app.post("/webhook", async (req, res) => {
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
         (alternatives.length
           ? `\n\nTe recomiendo estas alternativas con existencia:\n` +
-            alternatives
-              .map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`)
-              .join("\n")
+            alternatives.map((a, i) => `${i + 1}) ${a.nombre}${a.codigo ? ` (${a.codigo})` : ""} - ${a.precio}`).join("\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -756,13 +789,15 @@ app.post("/webhook", async (req, res) => {
         fallback,
       });
 
-      sessions.set(from, { pending: null, lastOptions: [p] });
+      // no anclamos por defecto aquí (solo anclamos en asesor)
+      sessions.delete(from);
+
       await sendWhatsAppText(from, reply);
       return;
     }
 
     // múltiples: lista y pedir elección
-    sessions.set(from, { pending: "pick", lastOptions: products });
+    sessions.set(from, { pending: "pick", lastOptions: products, anchorCategory: sess.anchorCategory || null });
 
     const opciones = products.map((p, i) => ({
       n: i + 1,
