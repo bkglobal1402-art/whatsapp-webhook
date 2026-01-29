@@ -161,30 +161,53 @@ function isNoStockRequest(text = "") {
   return keys.some((k) => t.includes(k));
 }
 
+// ✅ NUEVO: detectar preguntas de llegada/reposición/ETA
+function isEtaRequest(text = "") {
+  const t = norm(text);
+  const keys = [
+    "para cuando llegan",
+    "cuando llegan",
+    "cuando vuelven",
+    "cuando hay",
+    "cuando entran",
+    "cuando ingresan",
+    "cuando reponen",
+    "cuando hay stock",
+    "fecha de llegada",
+    "fecha de ingreso",
+    "cuando tendran",
+    "cuando tendrian",
+    "cuanto se demora",
+    "en cuanto tiempo llega",
+    "en cuanto tiempo vuelven",
+    "cuando vuelve a haber",
+    "cuando les llega",
+    "cuando les entran",
+  ];
+  return keys.some((k) => t.includes(k));
+}
+
 /**
  * ✅ IMPORTANTE:
  * El cliente NO debe ver códigos/nombres internos.
- * En Odoo suele venir "Nombre (CODIGO)" o "[CODIGO] Nombre".
- * Esta función intenta "limpiar" para mostrar un nombre público más humano.
+ * Esta función limpia "[CODIGO] ..." o "(CODIGO)" al final, etc.
  */
 function publicName(displayName = "") {
   let s = String(displayName || "").trim();
-
-  // Quita cosas tipo "[ABC123]" al inicio
   s = s.replace(/^\[[^\]]+\]\s*/g, "");
-
-  // Quita paréntesis al final que suelen ser códigos: "(ABC123)" "(12345)"
   s = s.replace(/\s*\(([A-Za-z0-9\-\_\. ]{2,})\)\s*$/g, "").trim();
-
-  // Quita tokens muy "codigo": 4+ dígitos seguidos o mezcla alfanumérica rara
   s = s.replace(/\b[A-Z]{2,}\d{2,}\b/g, "").replace(/\b\d{4,}\b/g, "").trim();
-
-  // Limpia espacios dobles
   s = s.replace(/\s{2,}/g, " ").trim();
-
-  // Si quedó muy corto, devuélvelo como venía (mejor mostrar algo que nada)
   if (s.length < 4) return String(displayName || "").trim();
   return s;
+}
+
+// ✅ NUEVO: decide si mostramos precio o "por confirmar"
+function priceLabelCOP(n) {
+  const x = Math.round(Number(n || 0));
+  // si tu Odoo tiene list_price = 1 (como en tu captura), no lo mostramos
+  if (!isFinite(x) || x < 1000) return "Precio: Por confirmar";
+  return `Precio: ${moneyCOP(x)}`;
 }
 
 /* =========================
@@ -342,12 +365,10 @@ function allowSuggestionsByCategoryName(catName = "") {
 function detectAdvisorCategoryFromNeed(text = "") {
   const t = norm(text);
 
-  // Cerraduras
   if (t.includes("cerradura") || t.includes("chapa") || t.includes("puerta")) {
     return "CERRADURAS DIGITALES";
   }
 
-  // Intercom
   if (t.includes("intercom") || t.includes("intercomunicador") || t.includes("moto") || t.includes("casco")) {
     return "INTERCOMUNICADORES";
   }
@@ -467,7 +488,6 @@ SESSION:
 async function generateReplyWithOpenAI({ mode, userText, data, fallback }) {
   if (!OPENAI_API_KEY) return fallback;
 
-  // ✅ Tu prompt + reglas de salida estrictas JSON
   const sys = `
 ${BK_SYSTEM_PROMPT}
 
@@ -475,7 +495,8 @@ REGLAS TÉCNICAS (OBLIGATORIAS):
 - Usa ÚNICAMENTE la info que venga en DATA.
 - NUNCA muestres cantidades de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
 - Si DATA trae "opciones" u "opciones_sin_existencia", presenta las opciones numeradas (1), (2), (3)...
-- Si no hay opciones, haz 1-2 preguntas cortas para poder cotizar o verificar.
+- Si el cliente pregunta por "cuándo llega / reposición / fecha", y DATA no trae una fecha exacta,
+  debes decir "No tengo fecha exacta confirmada en este momento" y ofrecer verificar/avisar.
 - Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
 `.trim();
 
@@ -490,14 +511,12 @@ ${JSON.stringify(data, null, 2)}
     const obj = await openaiChatJSON({ system: sys, user, temperature: 0.35 });
     const txt = obj?.reply && typeof obj.reply === "string" ? obj.reply.trim() : "";
 
-    // ✅ VALIDACIÓN: si venían opciones y OpenAI no listó, usamos fallback
     const hasOptions = Array.isArray(data?.opciones) && data.opciones.length > 0;
     const hasNoOptions = Array.isArray(data?.opciones_sin_existencia) && data.opciones_sin_existencia.length > 0;
 
     if (hasOptions || hasNoOptions) {
       const hasNumbered = (/\b1\)|\b1\./.test(txt) && /\b2\)|\b2\./.test(txt));
-      const mentionsPrice = /precio/i.test(txt) || /\$\d/.test(txt);
-      if (!hasNumbered || !mentionsPrice) return fallback;
+      if (!hasNumbered) return fallback;
     }
 
     if (txt) return txt;
@@ -557,11 +576,27 @@ function seenBefore(msgId) {
 }
 
 /* =========================
+   ✅ Respuesta ETA / reposición (sin inventar)
+========================= */
+async function respondEta({ from, userText, categoryName }) {
+  const fallback =
+    `Buena pregunta 👌\n` +
+    `En este momento no tengo una fecha exacta confirmada de llegada para ${categoryName}.\n` +
+    `Si quieres, lo verifico y te aviso apenas entre.\n\n` +
+    `Para recomendarte bien: ¿la necesitas para interior o exterior y prefieres huella, clave o tarjeta?`;
+
+  const reply = await generateReplyWithOpenAI({
+    mode: "ETA_REPOSICION",
+    userText,
+    data: { categoria: categoryName, note: "No hay fecha exacta en Odoo. Ofrecer verificar y asesorar." },
+    fallback,
+  });
+
+  await sendWhatsAppText(from, reply);
+}
+
+/* =========================
    ✅ ASESOR (Cerraduras / Intercom)
-   - Mantiene contexto incluso sin stock
-   - Si hay stock: lista 3-5 con existencia y permite elegir
-   - Si NO hay stock: lista 3-5 sin existencia (con precio) y mantiene anchorCategory
-   - NO muestra códigos ni nombres internos (se limpia el nombre)
 ========================= */
 async function respondAdvisorOptions({ from, userText, categoryName, want = "AUTO" }) {
   const kw = buildNeedKeyword(userText);
@@ -588,7 +623,7 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
     enriched.push({
       id: p.id,
       nombre_publico: publicName(p.display_name),
-      precio: moneyCOP(price),
+      precio_label: priceLabelCOP(price),
       existencia: has ? "HAY" : "NO_HAY",
     });
   }
@@ -609,14 +644,12 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
 
   // ✅ Con existencia
   if (showInStock && topIn.length) {
-    // lastOptions debe ser product.product original para que PICK funcione
     const topProducts = found.filter((p) => topIn.some((t) => t.id === p.id)).slice(0, topIn.length);
-
     sessions.set(from, { pending: "pick", lastOptions: topProducts, anchorCategory: categoryName });
 
     const fallback =
       `Perfecto 👌 Estas son opciones con EXISTENCIA ahora mismo:\n\n` +
-      topIn.map((o, i) => `${i + 1}) ${o.nombre_publico}\nPrecio: ${o.precio}\n✅ Hay existencia`).join("\n\n") +
+      topIn.map((o, i) => `${i + 1}) ${o.nombre_publico}\n${o.precio_label}\n✅ Hay existencia`).join("\n\n") +
       `\n\n${pregunta}\nResponde con el número (1-${topIn.length}).`;
 
     const reply = await generateReplyWithOpenAI({
@@ -630,14 +663,14 @@ async function respondAdvisorOptions({ from, userText, categoryName, want = "AUT
     return;
   }
 
-  // ✅ Sin existencia: LISTA MODELOS sin pedir código
+  // ✅ Sin existencia: lista modelos SIN pedir código
   if (topOut.length) {
     sessions.set(from, { pending: null, lastOptions: [], anchorCategory: categoryName });
 
     const fallback =
       `En este momento no tengo opciones con existencia en ${categoryName} 😕\n` +
       `Pero manejo estas opciones (hoy están sin existencia):\n\n` +
-      topOut.map((o, i) => `${i + 1}) ${o.nombre_publico}\nPrecio: ${o.precio}\n❌ Sin existencia`).join("\n\n") +
+      topOut.map((o, i) => `${i + 1}) ${o.nombre_publico}\n${o.precio_label}\n❌ Sin existencia`).join("\n\n") +
       `\n\n${pregunta}`;
 
     const reply = await generateReplyWithOpenAI({
@@ -740,7 +773,7 @@ app.post("/webhook", async (req, res) => {
     // Obtener sesión
     const sess = sessions.get(from) || { pending: null, lastOptions: [], anchorCategory: null };
 
-    // ✅ CLASIFICADOR: si no tienes OpenAI, usamos regla básica
+    // ✅ CLASIFICADOR
     let intentObj;
     if (OPENAI_API_KEY) {
       intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
@@ -765,8 +798,12 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // ✅ Mantener tema por ANCLA: opciones / sin existencia
+    // ✅ Mantener tema por ANCLA (esto arregla tu caso “¿para cuándo llegan?”)
     if (sess.anchorCategory && !isLikelyCode(text)) {
+      if (isEtaRequest(text)) {
+        await respondEta({ from, userText: text, categoryName: sess.anchorCategory });
+        return;
+      }
       if (isGenericOptionsText(text)) {
         await respondAdvisorOptions({ from, userText: text, categoryName: sess.anchorCategory, want: "IN_STOCK" });
         return;
@@ -800,7 +837,7 @@ app.post("/webhook", async (req, res) => {
         alternatives = await Promise.all(
           alts.map(async (p) => ({
             nombre_publico: publicName(p.display_name),
-            precio: moneyCOP(await odooGetPrice(p)),
+            precio_label: priceLabelCOP(await odooGetPrice(p)),
             existencia: "HAY",
           }))
         );
@@ -810,7 +847,7 @@ app.post("/webhook", async (req, res) => {
         producto: {
           nombre_publico: publicName(chosen.display_name),
           categoria: catName || null,
-          precio: moneyCOP(price),
+          precio_label: priceLabelCOP(price),
           existencia: has ? "HAY" : "NO_HAY",
         },
         alternativas: alternatives,
@@ -818,11 +855,11 @@ app.post("/webhook", async (req, res) => {
 
       const fallback =
         `${safe.producto.nombre_publico}\n` +
-        `Precio: ${safe.producto.precio}\n` +
+        `${safe.producto.precio_label}\n` +
         (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
         (alternatives.length
           ? `\n\nAlternativas con existencia:\n` +
-            alternatives.map((a, i) => `${i + 1}) ${a.nombre_publico} - ${a.precio}`).join("\n")
+            alternatives.map((a, i) => `${i + 1}) ${a.nombre_publico}\n${a.precio_label}\n✅ Hay existencia`).join("\n\n")
           : "");
 
       const reply = await generateReplyWithOpenAI({
@@ -832,9 +869,7 @@ app.post("/webhook", async (req, res) => {
         fallback,
       });
 
-      // Mantener ancla
       sessions.set(from, { pending: null, lastOptions: [], anchorCategory: sess.anchorCategory || null });
-
       await sendWhatsAppText(from, reply);
       return;
     }
@@ -852,7 +887,6 @@ app.post("/webhook", async (req, res) => {
 
     /* =========================
        Búsqueda normal (otros productos)
-       (aquí SÍ puede pedir datos al cliente porque no son cerraduras/intercom)
     ========================= */
     let products = [];
 
@@ -878,37 +912,19 @@ app.post("/webhook", async (req, res) => {
       const p = products[0];
       const price = await odooGetPrice(p);
       const has = await odooHasStock(p.id);
-      const catName = getCategoryName(p);
-
-      let alternatives = [];
-      if (!has && allowSuggestionsByCategoryName(catName)) {
-        const alts = await odooSuggestAlternativesSameCategory({ product: p, limit: 3 });
-        alternatives = await Promise.all(
-          alts.map(async (x) => ({
-            nombre_publico: publicName(x.display_name),
-            precio: moneyCOP(await odooGetPrice(x)),
-            existencia: "HAY",
-          }))
-        );
-      }
 
       const safe = {
         producto: {
           nombre_publico: publicName(p.display_name),
-          precio: moneyCOP(price),
+          precio_label: priceLabelCOP(price),
           existencia: has ? "HAY" : "NO_HAY",
         },
-        alternativas: alternatives,
       };
 
       const fallback =
         `${safe.producto.nombre_publico}\n` +
-        `Precio: ${safe.producto.precio}\n` +
-        (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") +
-        (alternatives.length
-          ? `\n\nAlternativas con existencia:\n` +
-            alternatives.map((a, i) => `${i + 1}) ${a.nombre_publico} - ${a.precio}`).join("\n")
-          : "");
+        `${safe.producto.precio_label}\n` +
+        (safe.producto.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia");
 
       const reply = await generateReplyWithOpenAI({
         mode: "RESPUESTA_FINAL",
@@ -922,7 +938,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // múltiples: lista y pedir elección
     sessions.set(from, { pending: "pick", lastOptions: products, anchorCategory: sess.anchorCategory || null });
 
     const opciones = products.map((p, i) => ({
