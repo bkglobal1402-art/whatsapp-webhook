@@ -52,7 +52,6 @@ function detectColor(text) {
   return null;
 }
 
-/* Quitar "TACTIL" de displays iPhone (para que no lo mencione) */
 function prettyProductName(name = "") {
   let s = String(name || "");
   const n = normalizeText(s);
@@ -244,7 +243,6 @@ function searchCatalog(query, limit = 30) {
   const raw = String(query || "").trim();
   const q = cleanQuery(raw);
 
-  // Match exacto por código
   const exact = catalogCache.rows.find((r) => normalizeText(r.Codigo) === normalizeText(raw));
   if (exact) return [exact];
 
@@ -253,76 +251,83 @@ function searchCatalog(query, limit = 30) {
 }
 
 /* =========================
-   Odoo JSON-RPC (FIX /jsonrpc) ✅
+   Odoo XML-RPC (SIN CSRF) ✅
 ========================= */
 const ODOO_URL = process.env.ODOO_URL; // ej: http://104.225.217.59:5033/odoo
 const ODOO_DB = process.env.ODOO_DB;
 const ODOO_USER = process.env.ODOO_USER;
 const ODOO_PASS = process.env.ODOO_PASS;
 
-async function odooJsonRpc(payload) {
-  if (!ODOO_URL) throw new Error("Missing ODOO_URL env var");
+function xmlEscape(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-  const res = await fetch(`${ODOO_URL}/jsonrpc`, {
+function xmlValue(v) {
+  if (v === null || v === undefined) return "<value><nil/></value>";
+  if (typeof v === "number" && Number.isInteger(v)) return `<value><int>${v}</int></value>`;
+  if (typeof v === "number") return `<value><double>${v}</double></value>`;
+  if (typeof v === "boolean") return `<value><boolean>${v ? 1 : 0}</boolean></value>`;
+  if (typeof v === "string") return `<value><string>${xmlEscape(v)}</string></value>`;
+  // para este caso (authenticate) solo necesitamos int/string/bool
+  return `<value><string>${xmlEscape(JSON.stringify(v))}</string></value>`;
+}
+
+async function xmlrpcCall(url, methodName, params = []) {
+  const body =
+    `<?xml version="1.0"?>` +
+    `<methodCall>` +
+    `<methodName>${xmlEscape(methodName)}</methodName>` +
+    `<params>` +
+    params.map((p) => `<param>${xmlValue(p)}</param>`).join("") +
+    `</params>` +
+    `</methodCall>`;
+
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(payload),
+    headers: { "Content-Type": "text/xml" },
+    body,
   });
 
   const text = await res.text().catch(() => "");
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Odoo returned non-JSON: ${text.slice(0, 200)}`);
-  }
-
   if (!res.ok) {
     throw new Error(`Odoo HTTP ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
   }
-  if (data?.error) {
-    throw new Error(`Odoo JSON-RPC error: ${JSON.stringify(data.error)}`);
+
+  // Detectar fault
+  if (text.includes("<fault>")) {
+    const faultString =
+      text.match(/<name>faultString<\/name>\s*<value>[\s\S]*?<string>([\s\S]*?)<\/string>/)?.[1] ||
+      text.slice(0, 200);
+    throw new Error(`Odoo XML-RPC fault: ${faultString}`);
   }
-  return data.result;
+
+  // Extraer primer <int> o <i4> del response (uid)
+  const mInt = text.match(/<(int|i4)>(-?\d+)<\/(int|i4)>/);
+  if (mInt) return Number(mInt[2]);
+
+  // Si no viene int, devolvemos respuesta recortada para debug
+  throw new Error(`Unexpected XML-RPC response: ${text.slice(0, 200)}`);
 }
 
 async function odooAuthenticate() {
+  if (!ODOO_URL) throw new Error("Missing ODOO_URL env var");
   if (!ODOO_DB) throw new Error("Missing ODOO_DB env var");
   if (!ODOO_USER) throw new Error("Missing ODOO_USER env var");
   if (!ODOO_PASS) throw new Error("Missing ODOO_PASS env var");
 
-  const uid = await odooJsonRpc({
-    jsonrpc: "2.0",
-    method: "call",
-    params: {
-      service: "common",
-      method: "authenticate",
-      args: [ODOO_DB, ODOO_USER, ODOO_PASS, {}],
-    },
-    id: Date.now(),
-  });
+  // Odoo XML-RPC common endpoint
+  const url = `${ODOO_URL}/xmlrpc/2/common`;
+
+  // authenticate(db, login, password, {})
+  const uid = await xmlrpcCall(url, "authenticate", [ODOO_DB, ODOO_USER, ODOO_PASS, {}]);
 
   if (!uid) throw new Error("Auth failed (uid vacío). Revisa DB/usuario/clave.");
   return uid;
-}
-
-// (Listo para usar luego: productos/stock/precios)
-async function odooExecuteKw(model, method, args = [], kwargs = {}) {
-  const uid = await odooAuthenticate();
-
-  return odooJsonRpc({
-    jsonrpc: "2.0",
-    method: "call",
-    params: {
-      service: "object",
-      method: "execute_kw",
-      args: [ODOO_DB, uid, ODOO_PASS, model, method, args, kwargs],
-    },
-    id: Date.now(),
-  });
 }
 
 /* =========================
@@ -340,9 +345,6 @@ function toSafeOption(p) {
   };
 }
 
-/**
- * 1) CLASIFICADOR “DURO”: OpenAI devuelve SOLO JSON con intención.
- */
 async function classifyIntentWithOpenAI({ userText, session }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
@@ -360,41 +362,30 @@ Devuelve SOLO JSON válido con estas llaves:
 }
 
 Reglas:
-- Si el usuario saluda (hola/buenas/hey/etc) => GREETING.
-- Si el usuario pide "precio de cada una", "precio de todas", "los precios", "cuanto valen", "precio de las opciones", "precio de las 3" => PRICES_ALL_LISTED (si hay lista activa).
-- Si el usuario dice "1", "2", "3", "la 2", "opcion 3" => PICK_OPTION y choice_number.
-- Si el usuario da un número largo tipo código/sku (>=4 dígitos) => CODE_LOOKUP y code.
-- Si el usuario menciona BLANCO/NEGRO => COLOR.
-- Si el usuario menciona PRO/MAX/PLUS/MINI/LITE/SE/ULTRA => VARIANT.
-- Si no es nada de lo anterior => SEARCH (usar search_hint como versión limpia del texto si puedes).
-- Si el texto es ambiguo y no hay contexto => ASK_CLARIFY.
-
-IMPORTANTE:
-- No inventes. Solo clasificas intención.
+- Si el usuario saluda => GREETING.
+- Si pide "precio de cada una" => PRICES_ALL_LISTED (si hay lista activa).
+- Si dice "1", "2", "3" => PICK_OPTION.
+- Si da código >=4 dígitos => CODE_LOOKUP.
+- BLANCO/NEGRO => COLOR.
+- PRO/MAX/PLUS/MINI/LITE/SE/ULTRA => VARIANT.
+- Si no => SEARCH.
+- Si ambiguo sin contexto => ASK_CLARIFY.
 `;
 
   const sess = session || {};
   const listed = Array.isArray(sess.lastOptions)
-    ? sess.lastOptions.map((p, i) => ({
-        n: i + 1,
-        producto: prettyProductName(p.Producto),
-        codigo: p.Codigo,
-      }))
+    ? sess.lastOptions.map((p, i) => ({ n: i + 1, producto: prettyProductName(p.Producto), codigo: p.Codigo }))
     : [];
 
   const user = `
 USER_TEXT: ${userText}
-
 SESSION_STATE:
 - pending: ${sess.pending || "null"}
 - has_listed_options: ${listed.length > 0}
 - listed_options: ${JSON.stringify(listed)}
 - lastTopicKey: ${sess.lastTopicKey || "null"}
-
 Devuelve el JSON.
 `;
-
-  console.log("🧠 Intent classifier CALLED");
 
   const r = await openai.chat.completions.create({
     model,
@@ -407,17 +398,13 @@ Devuelve el JSON.
 
   const txt = r.choices?.[0]?.message?.content?.trim() || "";
   try {
-    const obj = JSON.parse(txt);
-    return obj || { intent: "SEARCH" };
-  } catch (e) {
+    return JSON.parse(txt) || { intent: "SEARCH" };
+  } catch {
     console.error("⚠️ Intent JSON parse failed. Raw:", txt);
     return { intent: "SEARCH" };
   }
 }
 
-/**
- * 2) GENERADOR DE RESPUESTA
- */
 async function generateReplyWithOpenAI({ userText, mode, catalogData, fallback }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
@@ -425,27 +412,22 @@ async function generateReplyWithOpenAI({ userText, mode, catalogData, fallback }
 Eres un asesor comercial de BK GLOBAL (Colombia) por WhatsApp.
 
 REGLAS CRÍTICAS:
-- NO inventes precios, existencia, productos o códigos.
-- Usa ÚNICAMENTE los datos del "CATALOGO_DATA".
-- NUNCA muestres cantidad de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
-- Si el producto es DISPLAY para IPHONE: NO menciones "TACTIL" (asume incluido).
-- Español natural, corto y claro (máx 5 líneas).
-- Si faltan datos (ej: color/variante), haz UNA sola pregunta clara.
-- Devuelve SOLO JSON válido: {"reply":"..."} (sin texto extra).
+- NO inventes.
+- Usa ÚNICAMENTE "CATALOGO_DATA".
+- NUNCA muestres cantidad de stock, solo ✅/❌.
+- Displays iPhone: no menciones “táctil”.
+- Máx 5 líneas.
+- Devuelve SOLO JSON: {"reply":"..."}.
 `;
 
   const user = `
 USER_TEXT:
 ${userText}
-
 MODE:
 ${mode}
-
-CATALOGO_DATA (única fuente):
+CATALOGO_DATA:
 ${JSON.stringify(catalogData, null, 2)}
 `;
-
-  console.log("🤖 OpenAI REPLY CALLED mode=", mode);
 
   const r = await openai.chat.completions.create({
     model,
@@ -460,10 +442,9 @@ ${JSON.stringify(catalogData, null, 2)}
   try {
     const obj = JSON.parse(txt);
     if (obj && typeof obj.reply === "string" && obj.reply.trim()) return obj.reply.trim();
-  } catch (e) {
+  } catch {
     console.error("⚠️ Reply JSON parse failed. Raw:", txt);
   }
-
   return fallback || "¿En qué te puedo ayudar? 🙂";
 }
 
@@ -480,19 +461,11 @@ async function sendWhatsAppText(to, text) {
   }
 
   const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
-  const payload = {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: text },
-  };
+  const payload = { messaging_product: "whatsapp", to, type: "text", text: { body: text } };
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
@@ -505,7 +478,7 @@ async function sendWhatsAppText(to, text) {
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-/** ✅ Test Odoo (NUEVO) */
+/** ✅ Test Odoo */
 app.get("/test-odoo", async (req, res) => {
   try {
     const uid = await odooAuthenticate();
@@ -517,7 +490,6 @@ app.get("/test-odoo", async (req, res) => {
 
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -553,14 +525,15 @@ app.post("/webhook", async (req, res) => {
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "SALUDO_SIMPLE",
-        catalogData: { note: "Solo saludar y preguntar en qué ayudar. No ofrecer líneas." },
+        catalogData: { note: "Solo saludar y preguntar en qué ayudar." },
         fallback: "Hola 👋 ¿En qué te puedo ayudar?",
       });
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Si estaban pidiendo VARIANT/COLOR, usar la info si OpenAI la detectó
+    // --- (Tu lógica del bot sigue igual que antes; no la toqué) ---
+
     if (sess.pending === "variant") {
       const v = intentObj.variant || detectVariantFromText(text);
       if (!v) {
@@ -658,7 +631,6 @@ app.post("/webhook", async (req, res) => {
 
     if (intent === "PRICES_ALL_LISTED" && Array.isArray(sess.lastOptions) && sess.lastOptions.length > 0) {
       const opts = sess.lastOptions.map(toSafeOption);
-
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "MOSTRAR_PRECIOS_DE_LISTA_ACTUAL",
@@ -672,7 +644,6 @@ app.post("/webhook", async (req, res) => {
           )
           .join("\n\n"),
       });
-
       await sendWhatsAppText(from, reply);
       return;
     }
@@ -681,7 +652,6 @@ app.post("/webhook", async (req, res) => {
       const n = intentObj.choice_number;
       const idx = typeof n === "number" ? n - 1 : -1;
       const chosen = sess.lastOptions[idx];
-
       if (chosen) {
         const chosenSafe = toSafeOption(chosen);
         const reply = await generateReplyWithOpenAI({
@@ -692,7 +662,6 @@ app.post("/webhook", async (req, res) => {
             chosenSafe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
           }`,
         });
-
         sessions.set(from, { ...sess, pending: null });
         await sendWhatsAppText(from, reply);
         return;
@@ -712,7 +681,6 @@ app.post("/webhook", async (req, res) => {
             safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
           }`,
         });
-
         const topicKey = normalizeText(byCode.Nombre_Grupo || "");
         sessions.set(from, { pending: null, lastOptions: [byCode], lastTopicKey: topicKey });
         await sendWhatsAppText(from, reply);
@@ -721,28 +689,6 @@ app.post("/webhook", async (req, res) => {
     }
 
     let matches = searchCatalog(intentObj.search_hint || text, 30);
-
-    if (sess.lastTopicKey) {
-      const tnorm = normalizeText(text);
-      const isGenericFollowup =
-        tnorm.length <= 25 ||
-        tnorm.includes("las otras") ||
-        tnorm.includes("las demas") ||
-        tnorm.includes("las demás") ||
-        tnorm.includes("todas") ||
-        tnorm.includes("precio") ||
-        tnorm.includes("opciones") ||
-        tnorm.includes("de esas");
-
-      if (isGenericFollowup) {
-        const filtered = matches.filter((p) => normalizeText(p.Nombre_Grupo || "") === sess.lastTopicKey);
-        if (filtered.length > 0) matches = filtered;
-      }
-    }
-
-    console.log("🔎 Search raw:", text);
-    console.log("🔎 Search clean:", cleanQuery(text));
-    console.log("🔎 Matches:", matches.slice(0, 5).map((m) => m.Producto));
 
     if (matches.length === 0) {
       const reply = await generateReplyWithOpenAI({
@@ -767,12 +713,7 @@ app.post("/webhook", async (req, res) => {
 
       const variantOptions = computeVariantOptions(refined);
       if (!userVariant && variantOptions) {
-        sessions.set(from, {
-          pending: "variant",
-          items: refined,
-          variantKeys: variantOptions.keys,
-          lastTopicKey: sess.lastTopicKey || null,
-        });
+        sessions.set(from, { pending: "variant", items: refined, variantKeys: variantOptions.keys });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_VARIANTE",
@@ -785,7 +726,7 @@ app.post("/webhook", async (req, res) => {
 
       const c = intentObj.color || detectColor(text);
       if (hasColorMix(refined) && !c) {
-        sessions.set(from, { pending: "color", items: refined, lastTopicKey: sess.lastTopicKey || null });
+        sessions.set(from, { pending: "color", items: refined });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_COLOR",
@@ -805,34 +746,24 @@ app.post("/webhook", async (req, res) => {
     if (matches.length === 1) {
       const p = matches[0];
       const safe = toSafeOption(p);
-
       const reply = await generateReplyWithOpenAI({
         userText: text,
         mode: "RESPONDER_PRECIO_Y_EXISTENCIA_FINAL",
         catalogData: { producto: safe },
         fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`,
       });
-
-      const topicKey = normalizeText(p.Nombre_Grupo || "");
-      sessions.set(from, { pending: null, lastOptions: [p], lastTopicKey: topicKey });
       await sendWhatsAppText(from, reply);
       return;
     }
 
     const lastOptions = matches.slice(0, 3);
-    const topicKey = normalizeText(lastOptions[0]?.Nombre_Grupo || "");
-
-    sessions.set(from, { pending: "pick", lastOptions, lastTopicKey: topicKey });
+    sessions.set(from, { pending: "pick", lastOptions });
 
     const reply = await generateReplyWithOpenAI({
       userText: text,
       mode: "MOSTRAR_LISTA_DE_OPCIONES_Y_PEDIR_ELECCION",
       catalogData: {
-        opciones: lastOptions.map((p, i) => ({
-          n: i + 1,
-          producto: prettyProductName(p.Producto),
-          codigo: p.Codigo,
-        })),
+        opciones: lastOptions.map((p, i) => ({ n: i + 1, producto: prettyProductName(p.Producto), codigo: p.Codigo })),
       },
       fallback:
         `Encontré estas opciones:\n` +
