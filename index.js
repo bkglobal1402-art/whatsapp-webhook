@@ -10,22 +10,22 @@ app.use(express.json());
 /* =========================
    ENV (Railway Variables)
 ========================= */
-const ODOO_URL = process.env.ODOO_URL;      // ej: http://104.225.217.59:5033  (mejor SIN /odoo)
+const ODOO_URL = process.env.ODOO_URL;      // ej: http://104.225.217.59:5033
 const ODOO_DB = process.env.ODOO_DB;        // ej: odoo_admin_pro
 const ODOO_USER = process.env.ODOO_USER;    // ej: bot@bkglobal.com.co
-const ODOO_PASS = process.env.ODOO_PASS;    // contraseña del bot
-const PRICELIST_ID = process.env.ODOO_PRICELIST_ID ? Number(process.env.ODOO_PRICELIST_ID) : null;
+const ODOO_PASS = process.env.ODOO_PASS;
 
-// WhatsApp Cloud API
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 /* =========================
    Helpers
 ========================= */
 function getRpcBase(url) {
-  // Si alguien deja .../odoo, lo recortamos para /jsonrpc
   const u = String(url || "").replace(/\/+$/, "");
   return u.replace(/\/odoo$/i, "");
 }
@@ -39,47 +39,24 @@ function norm(s = "") {
     .trim();
 }
 
-function looksLikeCode(text) {
-  const t = String(text || "").trim();
-  return /^\d{4,}$/.test(t);
+function moneyCOP(n) {
+  const x = Math.round(Number(n || 0));
+  if (!isFinite(x)) return "$0";
+  return `$${x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
 }
 
-function detectIntent(text) {
+function pickOptionNumber(text) {
   const t = norm(text);
-
-  const wantsPrice =
-    t.includes("precio") || t.includes("vale") || t.includes("cuesta") || t.includes("valor");
-
-  const wantsStock =
-    t.includes("hay") ||
-    t.includes("existencia") ||
-    t.includes("disponible") ||
-    t.includes("stock") ||
-    t.includes("tienen");
-
-  // por defecto: ambos (para responder completo)
-  return {
-    wantsPrice: wantsPrice || (!wantsPrice && !wantsStock),
-    wantsStock: wantsStock || (!wantsPrice && !wantsStock),
-  };
-}
-
-function cleanQuery(text) {
-  // Limpia muletillas para buscar mejor por nombre
-  return norm(text)
-    .replace(
-      /\b(tienes|tiene|hay|precio|vale|cuesta|disponible|stock|existencia|me|puedes|porfa|porfavor|necesito|quiero|busco|una|un|el|la|los|las|para|de|del|al|y|con|por|que|q|dame|info|informacion|cuanto|muestrame|muestra|por favor|pf)\b/g,
-      " "
-    )
-    .replace(/\s+/g, " ")
-    .trim();
+  const m = t.match(/\b(1|2|3)\b/);
+  if (m) return Number(m[1]);
+  return null;
 }
 
 /* =========================
    Odoo JSON-RPC
 ========================= */
 let authCache = { uid: null, at: 0 };
-const AUTH_TTL_MS = 10 * 60 * 1000; // 10 min
+const AUTH_TTL_MS = 10 * 60 * 1000;
 
 async function odooJsonRpc({ service, method, args = [], kwargs = {} }) {
   if (!ODOO_URL || !ODOO_DB || !ODOO_USER || !ODOO_PASS) {
@@ -103,6 +80,7 @@ async function odooJsonRpc({ service, method, args = [], kwargs = {} }) {
   });
 
   const data = await resp.json().catch(() => null);
+
   if (!resp.ok) {
     throw new Error(`Odoo HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 300)}`);
   }
@@ -138,27 +116,16 @@ async function odooExecuteKw(model, method, args = [], kwargs = {}) {
   });
 }
 
-/* =========================
-   Odoo Queries
-========================= */
-
-// Busca productos por código (default_code) o por nombre (ilike).
-// Devuelve hasta `limit` productos con id, display_name, default_code, list_price, type.
 async function odooFindProducts({ code = null, q = null, limit = 5 }) {
   const domain = [];
-
   if (code) {
     domain.push(["default_code", "=", String(code).trim()]);
   } else if (q) {
     const qq = String(q).trim();
-    // Busca por nombre o por código parcial
     domain.push("|", ["name", "ilike", qq], ["default_code", "ilike", qq]);
-  } else {
-    return [];
-  }
+  } else return [];
 
-  // product.product suele ser lo más directo para default_code
-  const fields = ["id", "display_name", "default_code", "list_price", "type", "product_tmpl_id"];
+  const fields = ["id", "display_name", "default_code", "list_price", "type"];
   const products = await odooExecuteKw("product.product", "search_read", [domain], {
     fields,
     limit,
@@ -168,18 +135,18 @@ async function odooFindProducts({ code = null, q = null, limit = 5 }) {
   return Array.isArray(products) ? products : [];
 }
 
-// Existencia “HAY/NO HAY” sin mostrar cantidades.
-// Suma quantity - reserved_quantity en ubicaciones internas.
 async function odooHasStock(productId) {
   if (!productId) return false;
 
-  const quants = await odooExecuteKw("stock.quant", "search_read", [[
-    ["product_id", "=", productId],
-    ["location_id.usage", "=", "internal"],
-  ]], {
-    fields: ["quantity", "reserved_quantity"],
-    limit: 2000,
-  });
+  const quants = await odooExecuteKw(
+    "stock.quant",
+    "search_read",
+    [[
+      ["product_id", "=", productId],
+      ["location_id.usage", "=", "internal"],
+    ]],
+    { fields: ["quantity", "reserved_quantity"], limit: 2000 }
+  );
 
   let available = 0;
   for (const q of quants || []) {
@@ -190,12 +157,131 @@ async function odooHasStock(productId) {
   return available > 0;
 }
 
-// Precio: usa list_price (precio de venta).
-// Si luego quieres pricelist real, lo agregamos, pero list_price es lo más estable.
 async function odooGetPrice(product) {
-  // product.list_price ya viene en search_read
   const p = Number(product?.list_price ?? 0);
   return isFinite(p) ? p : 0;
+}
+
+/* =========================
+   OpenAI (C: interpreta + redacta)
+========================= */
+async function openaiChatJSON({ system, user, temperature = 0 }) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) throw new Error(`OpenAI HTTP ${resp.status}: ${JSON.stringify(data)?.slice(0, 300)}`);
+  const txt = data?.choices?.[0]?.message?.content?.trim() || "";
+
+  try {
+    return JSON.parse(txt);
+  } catch {
+    // fallback: intenta extraer JSON si viene con texto
+    const start = txt.indexOf("{");
+    const end = txt.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      return JSON.parse(txt.slice(start, end + 1));
+    }
+    throw new Error(`OpenAI returned non-JSON: ${txt.slice(0, 200)}`);
+  }
+}
+
+async function classifyIntentWithOpenAI({ userText, session }) {
+  const sys = `
+Eres un clasificador de intención para un bot de WhatsApp de BK GLOBAL.
+Devuelve SOLO JSON válido con estas llaves:
+
+{
+  "intent": "GREETING" | "RESET" | "PICK_OPTION" | "CODE_LOOKUP" | "SEARCH" | "ASK_CLARIFY",
+  "choice_number": 1|2|3|null,
+  "code": "..."|null,
+  "query": "..."|null,
+  "want_price": true|false,
+  "want_stock": true|false
+}
+
+Reglas:
+- Saludos (hola/buenas/hey) => GREETING
+- Reset (reiniciar/cancelar/empezar/reset) => RESET
+- Si dice 1/2/3 o "la 2" => PICK_OPTION y choice_number
+- Si parece código (>=4 dígitos solo números) => CODE_LOOKUP y code
+- Si es búsqueda por texto => SEARCH y query (versión limpia)
+- Si es ambiguo => ASK_CLARIFY
+
+Detección precio/stock:
+- Si menciona precio/vale/cuesta/valor => want_price=true
+- Si menciona hay/existencia/stock/disponible => want_stock=true
+- Si no menciona nada => ambos true (responder completo)
+
+No inventes.
+`;
+
+  const sess = session || {};
+  const listed = Array.isArray(sess.lastOptions)
+    ? sess.lastOptions.map((p, i) => ({ n: i + 1, display_name: p.display_name, default_code: p.default_code }))
+    : [];
+
+  const user = `
+USER_TEXT: ${userText}
+
+SESSION:
+- pending: ${sess.pending || "null"}
+- has_listed_options: ${listed.length > 0}
+- listed_options: ${JSON.stringify(listed)}
+`;
+
+  const obj = await openaiChatJSON({ system: sys, user, temperature: 0 });
+
+  // fallback hardening
+  if (!obj?.intent) return { intent: "SEARCH", choice_number: null, code: null, query: null, want_price: true, want_stock: true };
+  if (obj.want_price !== false && obj.want_price !== true) obj.want_price = true;
+  if (obj.want_stock !== false && obj.want_stock !== true) obj.want_stock = true;
+  return obj;
+}
+
+async function generateReplyWithOpenAI({ mode, userText, data, fallback }) {
+  const sys = `
+Eres un asesor comercial por WhatsApp de BK GLOBAL (Colombia).
+
+REGLAS CRÍTICAS:
+- NO inventes precio, stock, productos o códigos.
+- Usa ÚNICAMENTE la info en DATA.
+- NUNCA muestres cantidades de stock. Solo: "✅ Hay existencia" o "❌ Sin existencia".
+- Respuesta corta y clara (máx 6 líneas).
+- Devuelve SOLO JSON válido: {"reply":"..."}.
+`;
+
+  const user = `
+MODE: ${mode}
+
+USER_TEXT: ${userText}
+
+DATA (fuente única):
+${JSON.stringify(data, null, 2)}
+`;
+
+  try {
+    const obj = await openaiChatJSON({ system: sys, user, temperature: 0.2 });
+    if (obj?.reply && typeof obj.reply === "string") return obj.reply.trim();
+  } catch (e) {
+    console.error("⚠️ OpenAI reply error:", e.message || e);
+  }
+  return fallback;
 }
 
 /* =========================
@@ -229,30 +315,24 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
-   Session (para elegir 1/2/3)
+   Session + Dedup (Meta test number fix)
 ========================= */
-const sessions = new Map();
-/*
-sessions.get(from) = {
-  pending: "pick" | null,
-  lastOptions: [ {id, display_name, default_code, list_price, ...} ],
-  wantsPrice: boolean,
-  wantsStock: boolean
-}
-*/
+const sessions = new Map(); // per phone
+// sessions.get(from) = { pending:"pick"|null, lastOptions:[...], want_price, want_stock }
 
-/* =========================
-   Format response
-========================= */
-function formatOptionLine(p, i) {
-  const code = p.default_code ? ` (${p.default_code})` : "";
-  return `${i + 1}) ${p.display_name}${code}`;
-}
+const seenMsg = new Map(); // msgId -> timestamp
+const SEEN_TTL = 10 * 60 * 1000;
 
-function moneyCOP(n) {
-  // formato simple (sin depender de locale)
-  const x = Math.round(Number(n || 0));
-  return `$${x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
+function seenBefore(msgId) {
+  if (!msgId) return false;
+  const now = Date.now();
+  // cleanup sometimes
+  for (const [k, ts] of seenMsg.entries()) {
+    if (now - ts > SEEN_TTL) seenMsg.delete(k);
+  }
+  if (seenMsg.has(msgId)) return true;
+  seenMsg.set(msgId, now);
+  return false;
 }
 
 /* =========================
@@ -260,7 +340,6 @@ function moneyCOP(n) {
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-/** ✅ Test Odoo */
 app.get("/test-odoo", async (req, res) => {
   try {
     const uid = await odooAuthenticate();
@@ -270,54 +349,15 @@ app.get("/test-odoo", async (req, res) => {
   }
 });
 
-/** Buscar productos */
-app.get("/odoo-find", async (req, res) => {
+app.get("/test-openai", async (req, res) => {
   try {
-    const code = req.query.code ? String(req.query.code) : null;
-    const q = req.query.q ? String(req.query.q) : null;
-
-    const products = await odooFindProducts({ code, q, limit: 10 });
-    res.json({ ok: true, count: products.length, products });
+    const obj = await classifyIntentWithOpenAI({ userText: "hola", session: {} });
+    res.json({ ok: true, sample: obj });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-/** Stock (HAY/NO HAY) por código */
-app.get("/odoo-stock", async (req, res) => {
-  try {
-    const code = String(req.query.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, error: "Missing ?code=" });
-
-    const products = await odooFindProducts({ code, limit: 1 });
-    if (!products.length) return res.json({ ok: true, found: false });
-
-    const has = await odooHasStock(products[0].id);
-    res.json({ ok: true, found: true, code, product: products[0].display_name, stock: has ? "HAY" : "NO_HAY" });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-/** Precio por código (list_price) */
-app.get("/odoo-price", async (req, res) => {
-  try {
-    const code = String(req.query.code || "").trim();
-    if (!code) return res.status(400).json({ ok: false, error: "Missing ?code=" });
-
-    const products = await odooFindProducts({ code, limit: 1 });
-    if (!products.length) return res.json({ ok: true, found: false });
-
-    const price = await odooGetPrice(products[0]);
-    res.json({ ok: true, found: true, code, product: products[0].display_name, price });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-/* =========================
-   WhatsApp webhook verify
-========================= */
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -327,9 +367,6 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-/* =========================
-   WhatsApp webhook receive
-========================= */
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
@@ -341,80 +378,156 @@ app.post("/webhook", async (req, res) => {
     const messages = value?.messages;
     if (!messages || messages.length === 0) return;
 
-    const from = messages[0]?.from;
-    const text = messages[0]?.text?.body || "";
+    const msg = messages[0];
+    const from = msg?.from;
+    const text = msg?.text?.body || "";
+    const msgId = msg?.id;
+
     if (!from || !text) return;
 
-    console.log("✅ Incoming message:", { from, text });
+    // ✅ Dedup (Test number often re-sends same message)
+    if (seenBefore(msgId)) {
+      console.log("🔁 Duplicate message ignored:", msgId);
+      return;
+    }
 
-    const t = text.trim();
-    const intent = detectIntent(t);
+    console.log("✅ Incoming message:", { from, text, msgId });
 
-    // Si hay sesión de escoger 1/2/3
-    const sess = sessions.get(from);
-    if (sess?.pending === "pick") {
-      const n = Number(t.replace(/[^\d]/g, ""));
-      const idx = Number.isFinite(n) ? n - 1 : -1;
+    // Hard reset if user says "hola" or reset words (extra protection)
+    const tnorm = norm(text);
+    const greetings = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hey"];
+    const resets = ["reiniciar", "reset", "cancelar", "empezar", "borrar"];
+    if (greetings.includes(tnorm) || resets.includes(tnorm)) {
+      sessions.delete(from);
+      const reply = await generateReplyWithOpenAI({
+        mode: "SALUDO",
+        userText: text,
+        data: { note: "Solo saluda y pregunta en qué ayudar." },
+        fallback: "Hola 👋 ¿En qué te puedo ayudar?",
+      });
+      await sendWhatsAppText(from, reply);
+      return;
+    }
+
+    const sess = sessions.get(from) || { pending: null, lastOptions: [], want_price: true, want_stock: true };
+
+    // 1) OpenAI: clasificar intención
+    const intentObj = await classifyIntentWithOpenAI({ userText: text, session: sess });
+
+    // 2) Manejo de reset por intención
+    if (intentObj.intent === "RESET") {
+      sessions.delete(from);
+      await sendWhatsAppText(from, "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando?");
+      return;
+    }
+
+    // 3) Si el usuario está escogiendo 1/2/3
+    if (sess.pending === "pick" || intentObj.intent === "PICK_OPTION") {
+      const n = intentObj.choice_number ?? pickOptionNumber(text);
+      const idx = typeof n === "number" ? n - 1 : -1;
       const chosen = sess.lastOptions?.[idx];
 
       if (!chosen) {
-        await sendWhatsAppText(from, "Dime 1, 2 o 3 para escoger una opción 🙂");
+        const reply = await generateReplyWithOpenAI({
+          mode: "PEDIR_OPCION",
+          userText: text,
+          data: { opciones: (sess.lastOptions || []).map((p, i) => ({ n: i + 1, nombre: p.display_name, codigo: p.default_code })) },
+          fallback: "Dime 1, 2 o 3 para escoger una opción 🙂",
+        });
+        await sendWhatsAppText(from, reply);
         return;
       }
 
-      const price = sess.wantsPrice ? await odooGetPrice(chosen) : null;
-      const has = sess.wantsStock ? await odooHasStock(chosen.id) : null;
+      const price = intentObj.want_price ? await odooGetPrice(chosen) : null;
+      const has = intentObj.want_stock ? await odooHasStock(chosen.id) : null;
 
-      let reply = `${chosen.display_name}${chosen.default_code ? ` (${chosen.default_code})` : ""}\n`;
-      if (sess.wantsPrice) reply += `Precio: ${moneyCOP(price)}\n`;
-      if (sess.wantsStock) reply += has ? "✅ Hay existencia" : "❌ Sin existencia";
+      const safe = {
+        nombre: chosen.display_name,
+        codigo: chosen.default_code || null,
+        precio: intentObj.want_price ? moneyCOP(price) : null,
+        existencia: intentObj.want_stock ? (has ? "HAY" : "NO_HAY") : null,
+      };
+
+      const reply = await generateReplyWithOpenAI({
+        mode: "RESPUESTA_FINAL",
+        userText: text,
+        data: { producto: safe },
+        fallback: `${safe.nombre}${safe.codigo ? ` (${safe.codigo})` : ""}\n${safe.precio ? `Precio: ${safe.precio}\n` : ""}${safe.existencia ? (safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") : ""}`.trim(),
+      });
 
       sessions.delete(from);
-      await sendWhatsAppText(from, reply.trim());
+      await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Flujo normal: buscar por código o por nombre
+    // 4) Buscar en Odoo (por código o por query)
     let products = [];
-    if (looksLikeCode(t)) {
-      products = await odooFindProducts({ code: t, limit: 3 });
+
+    if (intentObj.intent === "CODE_LOOKUP" && intentObj.code) {
+      products = await odooFindProducts({ code: intentObj.code, limit: 3 });
     } else {
-      const q = cleanQuery(t);
+      // SEARCH
+      const q = intentObj.query ? String(intentObj.query) : String(text);
       products = await odooFindProducts({ q, limit: 3 });
     }
 
+    // 5) Si no hay coincidencias: OpenAI pide aclaración con guía
     if (!products.length) {
-      await sendWhatsAppText(from, "No lo encontré en Odoo. ¿Me envías el código o el nombre exacto? 🙏");
+      const reply = await generateReplyWithOpenAI({
+        mode: "SIN_COINCIDENCIAS",
+        userText: text,
+        data: { tips: ["Pide el código del producto (si lo tiene).", "O el nombre exacto (ej: 'display iphone 11 pro max')."] },
+        fallback: "No lo encontré en Odoo. ¿Me envías el código o el nombre exacto? 🙏",
+      });
+      await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Si encontró 1 producto: responder directo
+    // 6) Si hay 1 producto: responder directo
     if (products.length === 1) {
       const p = products[0];
-      const price = intent.wantsPrice ? await odooGetPrice(p) : null;
-      const has = intent.wantsStock ? await odooHasStock(p.id) : null;
+      const price = intentObj.want_price ? await odooGetPrice(p) : null;
+      const has = intentObj.want_stock ? await odooHasStock(p.id) : null;
 
-      let reply = `${p.display_name}${p.default_code ? ` (${p.default_code})` : ""}\n`;
-      if (intent.wantsPrice) reply += `Precio: ${moneyCOP(price)}\n`;
-      if (intent.wantsStock) reply += has ? "✅ Hay existencia" : "❌ Sin existencia";
+      const safe = {
+        nombre: p.display_name,
+        codigo: p.default_code || null,
+        precio: intentObj.want_price ? moneyCOP(price) : null,
+        existencia: intentObj.want_stock ? (has ? "HAY" : "NO_HAY") : null,
+      };
 
-      await sendWhatsAppText(from, reply.trim());
+      const reply = await generateReplyWithOpenAI({
+        mode: "RESPUESTA_FINAL",
+        userText: text,
+        data: { producto: safe },
+        fallback: `${safe.nombre}${safe.codigo ? ` (${safe.codigo})` : ""}\n${safe.precio ? `Precio: ${safe.precio}\n` : ""}${safe.existencia ? (safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia") : ""}`.trim(),
+      });
+
+      sessions.set(from, { pending: null, lastOptions: [p], want_price: intentObj.want_price, want_stock: intentObj.want_stock });
+      await sendWhatsAppText(from, reply);
       return;
     }
 
-    // Múltiples: listar y pedir opción
-    sessions.set(from, {
-      pending: "pick",
-      lastOptions: products,
-      wantsPrice: intent.wantsPrice,
-      wantsStock: intent.wantsStock,
+    // 7) Si hay varias: listar 3 y pedir elección (OpenAI redacta)
+    sessions.set(from, { pending: "pick", lastOptions: products, want_price: intentObj.want_price, want_stock: intentObj.want_stock });
+
+    const optionsSafe = products.map((p, i) => ({
+      n: i + 1,
+      nombre: p.display_name,
+      codigo: p.default_code || null,
+    }));
+
+    const reply = await generateReplyWithOpenAI({
+      mode: "LISTAR_OPCIONES",
+      userText: text,
+      data: { opciones: optionsSafe },
+      fallback:
+        `Encontré estas opciones:\n` +
+        optionsSafe.map((o) => `${o.n}) ${o.nombre}${o.codigo ? ` (${o.codigo})` : ""}`).join("\n") +
+        `\n\n¿Cuál te interesa? (1, 2 o 3)`,
     });
 
-    const list = products.map((p, i) => formatOptionLine(p, i)).join("\n");
-    await sendWhatsAppText(
-      from,
-      `Encontré estas opciones:\n${list}\n\n¿Cuál te interesa? (1, 2 o 3)`
-    );
+    await sendWhatsAppText(from, reply);
   } catch (err) {
     console.error("❌ Webhook error:", err);
   }
