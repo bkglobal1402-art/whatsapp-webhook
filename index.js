@@ -262,6 +262,54 @@ function searchCatalog(query, limit = 30) {
 }
 
 /* =========================
+   Odoo JSON-RPC (NUEVO)
+========================= */
+const ODOO_URL = process.env.ODOO_URL; // ej: http://104.225.217.59:5033/odoo
+const ODOO_DB = process.env.ODOO_DB;   // ej: odoo (o el nombre real)
+const ODOO_USER = process.env.ODOO_USER;
+const ODOO_PASS = process.env.ODOO_PASS;
+
+async function odooRpc(path, payload) {
+  if (!ODOO_URL) throw new Error("Missing ODOO_URL env var");
+  const res = await fetch(`${ODOO_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text().catch(() => "");
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch (_) {
+    // si odoo devuelve HTML por error, lo dejamos como texto
+  }
+
+  if (!res.ok) {
+    throw new Error(`Odoo HTTP ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
+  }
+  return json;
+}
+
+async function odooAuthenticate() {
+  if (!ODOO_DB) throw new Error("Missing ODOO_DB env var");
+  if (!ODOO_USER) throw new Error("Missing ODOO_USER env var");
+  if (!ODOO_PASS) throw new Error("Missing ODOO_PASS env var");
+
+  const data = await odooRpc("/web/session/authenticate", {
+    jsonrpc: "2.0",
+    method: "call",
+    params: { db: ODOO_DB, login: ODOO_USER, password: ODOO_PASS },
+    id: Date.now(),
+  });
+
+  if (data?.error) throw new Error(`Auth error: ${JSON.stringify(data.error)}`);
+  const uid = data?.result?.uid;
+  if (!uid) throw new Error("No uid returned. Revisa ODOO_DB/ODOO_USER/ODOO_PASS.");
+  return uid;
+}
+
+/* =========================
    OpenAI
 ========================= */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -278,7 +326,6 @@ function toSafeOption(p) {
 
 /**
  * 1) CLASIFICADOR “DURO”: OpenAI devuelve SOLO JSON con intención.
- * Esto evita que el bot se confunda con “precio de cada una”, “dame los precios”, etc.
  */
 async function classifyIntentWithOpenAI({ userText, session }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -353,11 +400,7 @@ Devuelve el JSON.
 }
 
 /**
- * 2) GENERADOR DE RESPUESTA: OpenAI redacta SOLO con CATÁLOGO_DATA.
- * - NO inventa precios
- * - NUNCA muestra cantidades (solo hay/no hay)
- * - Display iPhone: no menciona “táctil”
- * - Respuesta corta
+ * 2) GENERADOR DE RESPUESTA
  */
 async function generateReplyWithOpenAI({ userText, mode, catalogData, fallback }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -445,6 +488,16 @@ async function sendWhatsAppText(to, text) {
    Routes
 ========================= */
 app.get("/", (req, res) => res.status(200).send("OK"));
+
+/** NUEVO: Test Odoo */
+app.get("/test-odoo", async (req, res) => {
+  try {
+    const uid = await odooAuthenticate();
+    res.json({ ok: true, uid });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mi_token_de_prueba";
@@ -633,7 +686,6 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppText(from, reply);
         return;
       }
-      // si OpenAI dijo PICK_OPTION pero no válida, cae abajo a pedir de nuevo
     }
 
     // CODE_LOOKUP: buscar por código
@@ -646,7 +698,9 @@ app.post("/webhook", async (req, res) => {
           userText: text,
           mode: "RESPONDER_PRECIO_Y_EXISTENCIA_POR_CODIGO",
           catalogData: { producto: safe },
-          fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`,
+          fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${
+            safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+          }`,
         });
 
         const topicKey = normalizeText(byCode.Nombre_Grupo || "");
@@ -654,7 +708,6 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppText(from, reply);
         return;
       }
-      // si no existe, continúa a búsqueda general
     }
 
     // 3) SEARCH (o fallback): buscar por catálogo (con ancla por tema)
@@ -708,7 +761,12 @@ app.post("/webhook", async (req, res) => {
 
       const variantOptions = computeVariantOptions(refined);
       if (!userVariant && variantOptions) {
-        sessions.set(from, { pending: "variant", items: refined, variantKeys: variantOptions.keys, lastTopicKey: sess.lastTopicKey || null });
+        sessions.set(from, {
+          pending: "variant",
+          items: refined,
+          variantKeys: variantOptions.keys,
+          lastTopicKey: sess.lastTopicKey || null,
+        });
         const reply = await generateReplyWithOpenAI({
           userText: text,
           mode: "PREGUNTAR_VARIANTE",
@@ -748,7 +806,9 @@ app.post("/webhook", async (req, res) => {
         userText: text,
         mode: "RESPONDER_PRECIO_Y_EXISTENCIA_FINAL",
         catalogData: { producto: safe },
-        fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"}`,
+        fallback: `${safe.producto}\nPrecio: ${safe.precio}\n${
+          safe.existencia === "HAY" ? "✅ Hay existencia" : "❌ Sin existencia"
+        }`,
       });
 
       const topicKey = normalizeText(p.Nombre_Grupo || "");
