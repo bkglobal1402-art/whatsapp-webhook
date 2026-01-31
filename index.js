@@ -119,6 +119,86 @@ function cleanWhatsAppText(text) {
 }
 
 /* =========================
+   ✅ NEW: Query parsing + scoring
+========================= */
+function tokenizeQuery(q) {
+  const x = norm(q);
+  const tokens = x.split(" ").filter(Boolean);
+  return tokens;
+}
+
+function includesAny(hay, words) {
+  const h = norm(hay);
+  return words.some((w) => h.includes(norm(w)));
+}
+
+function detectIphoneModel(q) {
+  const x = norm(q);
+  // detect "iphone 11", "iphone 11 pro", "iphone 11 pro max"
+  const hasIphone = x.includes("iphone");
+  if (!hasIphone) return null;
+
+  const has11 = x.includes(" 11") || x.includes("11 ");
+  if (!has11) return "iphone"; // iphone but model unknown
+
+  const hasProMax = x.includes("pro max") || x.includes("promax");
+  const hasPro = x.includes(" pro");
+
+  if (hasProMax) return "iphone 11 pro max";
+  if (hasPro) return "iphone 11 pro";
+  return "iphone 11";
+}
+
+function scoreProductForQuery({ name, code }, userQuery) {
+  const q = norm(userQuery);
+  const n = norm(name || "");
+  const c = norm(code || "");
+
+  let score = 0;
+
+  // Base: token overlap
+  const tokens = tokenizeQuery(q);
+  let overlap = 0;
+  for (const t of tokens) {
+    if (t.length < 2) continue;
+    if (n.includes(t) || c.includes(t)) overlap += 1;
+  }
+  score += overlap * 5;
+
+  // If user asks for display/pantalla, strongly prefer display-like products
+  const wantsDisplay = includesAny(q, ["display", "pantalla", "modulo", "tactil", "táctil"]);
+  if (wantsDisplay) {
+    if (includesAny(n, ["display", "pantalla"])) score += 40;
+    if (includesAny(n, ["tactil", "táctil", "incell", "oled", "lcd"])) score += 10;
+
+    // Penalize glass/visor unless user explicitly asks for it
+    const wantsGlass = includesAny(q, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
+    const isGlass = includesAny(n, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
+    if (isGlass && !wantsGlass) score -= 60;
+  }
+
+  // iPhone model strictness: if user says "iphone 11" (not pro), penalize pro/pro max
+  const qModel = detectIphoneModel(q);
+  if (qModel === "iphone 11") {
+    if (includesAny(n, ["pro max", "promax"])) score -= 50;
+    else if (includesAny(n, [" pro"])) score -= 30;
+    else score += 10;
+  } else if (qModel === "iphone 11 pro") {
+    if (includesAny(n, ["pro max", "promax"])) score -= 30;
+    if (includesAny(n, [" iphone 11 "]) && !includesAny(n, [" pro"])) score -= 10; // prefer pro
+    if (includesAny(n, [" pro"])) score += 10;
+  } else if (qModel === "iphone 11 pro max") {
+    if (includesAny(n, ["pro max", "promax"])) score += 15;
+    else score -= 10;
+  }
+
+  // slight boost if query appears as a phrase
+  if (q.length >= 4 && n.includes(q)) score += 25;
+
+  return score;
+}
+
+/* =========================
    Odoo JSON-RPC
 ========================= */
 let authCache = { uid: null, at: 0 };
@@ -255,7 +335,6 @@ function getCategoryName(product) {
 
 /* =========================
    ✅ FIX: Template details (safe fields)
-   - evita error por website_description inexistente
 ========================= */
 async function odooGetTemplateDetails(tmplId) {
   if (!tmplId) return null;
@@ -272,11 +351,8 @@ async function odooGetTemplateDetails(tmplId) {
     }
   };
 
-  // 1) si tuvieras website/ecommerce
   let row = await tryFields(["name", "description_sale", "website_description"]);
-  // 2) community común
   if (!row) row = await tryFields(["name", "description_sale", "description"]);
-  // 3) mínimo
   if (!row) row = await tryFields(["name", "description_sale"]);
   if (!row) row = await tryFields(["name"]);
   if (!row) return null;
@@ -286,7 +362,6 @@ async function odooGetTemplateDetails(tmplId) {
   );
   const description = descCandidates.length ? descCandidates[0].trim() : null;
 
-  // atributos (si existen)
   let attrs = [];
   try {
     const lines = await odooExecuteKw(
@@ -371,24 +446,31 @@ function resetSession(from) {
 }
 
 /* =========================
-   Prompt (asesor)
+   ✅ Prompt (asesor) - Mejorado
 ========================= */
 const BK_PROMPT = `
 Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
 No inventes nada. Usa SOLO lo que llega de herramientas.
 
-Reglas:
-- Siempre consulta Odoo (tools) cuando pidan opciones, precio, disponibilidad, características.
-- Si piden “características” de un producto, usa get_product_details.
-- Muestra código + nombre del producto (sí, aquí lo queremos).
-- Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
-- Precio: solo si viene real; si no hay, dilo.
-- Respuestas tipo WhatsApp: cortas, claras, SIN markdown.
+OBJETIVO:
+- Encontrar el producto correcto en Odoo y dar precio + disponibilidad de forma directa y útil.
 
-Si preguntan “¿para cuándo llegan?” y NO hay ETA real:
-- di que no hay fecha confirmada en sistema,
-- ofrece verificar,
-- ofrece alternativas con existencia.
+REGLAS OBLIGATORIAS:
+1) Si el cliente pide “precio”, responde con el precio de CADA opción válida encontrada (siempre que venga real).
+2) Si el cliente pide “display / pantalla / módulo”, prioriza productos que contengan “DISPLAY” o “PANTALLA” (y si aplica “TÁCTIL”).
+   - DESCARTA “VIDRIO”, “VISOR”, “CRISTAL”, “GLASS”, “PROTECTOR”, “LENTE” a menos que el cliente lo pida explícitamente.
+3) “iPhone 11” NO es lo mismo que “iPhone 11 Pro” ni “Pro Max”.
+   - Solo ofrece Pro/Pro Max si el cliente lo menciona o si NO existe el modelo exacto.
+4) Si hay varias opciones del mismo producto (ej: GX/JK, calidades), muestra TODAS en una sola respuesta con precio y stock.
+   - NO obligues a elegir antes de ver precios.
+5) Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
+6) Precio: solo si viene real; si no hay precio real, dilo.
+7) Siempre consulta Odoo (tools) cuando pidan opciones, precio, disponibilidad o características.
+8) Si piden “características”, usa get_product_details.
+
+FORMATO WhatsApp:
+- Corto, claro, sin markdown.
+- Muestra: Código, Nombre, Precio, Stock.
 `;
 
 /* =========================
@@ -471,10 +553,13 @@ async function tool_list_products_by_category(args, sess) {
   if (!category_name) return { ok: false, error: "category_name vacío" };
   sess.lastCategory = category_name;
 
+  // ✅ Traer más para rankear mejor, luego recortar
+  const fetchLimit = Math.min(Math.max(limit * 5, 20), 60);
+
   const products = await odooSearchProductsByCategory({
     categoryName: category_name,
     q: query,
-    limit: Math.min(Math.max(limit, 1), 60),
+    limit: fetchLimit,
   });
 
   if (!products.length) return { ok: true, category_name, count: 0, items: [] };
@@ -492,15 +577,36 @@ async function tool_list_products_by_category(args, sess) {
       price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
       in_stock: !!available,
       category: getCategoryName(p) || category_name,
+      _score: query ? scoreProductForQuery({ name: p.display_name, code: p.default_code }, query) : 0,
     };
   });
 
   let filtered = items;
   if (availability === "in_stock") filtered = items.filter((x) => x.in_stock);
   if (availability === "out_of_stock") filtered = items.filter((x) => !x.in_stock);
-  if (availability === "any") filtered = [...filtered.filter((x) => x.in_stock), ...filtered.filter((x) => !x.in_stock)];
 
-  filtered = pick(filtered, Math.min(Math.max(limit, 1), 60));
+  // ✅ Orden: score desc, luego in_stock primero
+  filtered.sort((a, b) => {
+    const sa = Number(a._score || 0);
+    const sb = Number(b._score || 0);
+    if (sb !== sa) return sb - sa;
+    if (b.in_stock !== a.in_stock) return (b.in_stock ? 1 : 0) - (a.in_stock ? 1 : 0);
+    return 0;
+  });
+
+  // ✅ Si availability === "any" mantener stock primero PERO sin perder score
+  if (availability === "any") {
+    const inS = filtered.filter((x) => x.in_stock);
+    const outS = filtered.filter((x) => !x.in_stock);
+    filtered = [...inS, ...outS];
+  }
+
+  filtered = pick(filtered, Math.min(Math.max(limit, 1), 60)).map((x) => {
+    const y = { ...x };
+    delete y._score;
+    return y;
+  });
+
   return { ok: true, category_name, count: filtered.length, items: filtered };
 }
 
@@ -509,7 +615,10 @@ async function tool_search_products(args, sess) {
   const limit = Number(args?.limit || OPTIONS_LIMIT);
   if (!query) return { ok: false, error: "query vacío" };
 
-  const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit, 1), 60) });
+  // ✅ Traer más para rankear; antes traías solo "limit" y por id desc podía caer vidrio/visor
+  const fetchLimit = Math.min(Math.max(limit * 6, 30), 60);
+
+  const products = await odooSearchProducts({ q: query, limit: fetchLimit });
   if (!products.length) return { ok: true, count: 0, items: [] };
 
   const ids = products.map((p) => p.id);
@@ -518,6 +627,13 @@ async function tool_search_products(args, sess) {
   const items = products.map((p) => {
     const available = (availMap.get(p.id) || 0) > 0;
     const priceOk = shouldShowPrice(p.list_price);
+    const product_tmpl_id = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
+
+    const score = scoreProductForQuery(
+      { name: p.display_name, code: p.default_code },
+      query
+    );
+
     return {
       id: p.id,
       name: p.display_name,
@@ -525,15 +641,34 @@ async function tool_search_products(args, sess) {
       price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
       in_stock: !!available,
       category: getCategoryName(p) || null,
-      product_tmpl_id: Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id,
+      product_tmpl_id,
+      _score: score,
     };
   });
 
+  // Mantén lastCategory si hay alguna
   const bestCat = items.find((x) => x.category)?.category || null;
   if (bestCat) sess.lastCategory = bestCat;
 
+  // ✅ Orden por score primero, y dentro por stock
+  items.sort((a, b) => {
+    const sa = Number(a._score || 0);
+    const sb = Number(b._score || 0);
+    if (sb !== sa) return sb - sa;
+    if (b.in_stock !== a.in_stock) return (b.in_stock ? 1 : 0) - (a.in_stock ? 1 : 0);
+    return 0;
+  });
+
+  // ✅ Stock primero sin perder relevancia
   const sorted = [...items.filter((x) => x.in_stock), ...items.filter((x) => !x.in_stock)];
-  return { ok: true, count: sorted.length, items: pick(sorted, Math.min(Math.max(limit, 1), 60)) };
+
+  const finalItems = pick(sorted, Math.min(Math.max(limit, 1), 60)).map((x) => {
+    const y = { ...x };
+    delete y._score;
+    return y;
+  });
+
+  return { ok: true, count: finalItems.length, items: finalItems };
 }
 
 async function tool_get_restock_eta(args, sess) {
@@ -555,16 +690,26 @@ async function tool_get_product_details(args, sess) {
   const limit = Number(args?.limit || 3);
   if (!query) return { ok: false, error: "query vacío" };
 
-  const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit, 1), 10) });
+  // ✅ Trae un poco más para que tome el correcto (igual solo muestra 3)
+  const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit * 4, 6), 12) });
   if (!products.length) {
     return { ok: true, found: 0, items: [], note: "No se encontró el producto en Odoo con ese texto/código." };
   }
 
-  const ids = products.map((p) => p.id);
+  // ✅ Rank también aquí para que details muestre lo más relevante primero
+  const ranked = products
+    .map((p) => ({
+      p,
+      score: scoreProductForQuery({ name: p.display_name, code: p.default_code }, query),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .map((x) => x.p);
+
+  const ids = ranked.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
 
   const items = [];
-  for (const p of products.slice(0, 3)) {
+  for (const p of ranked.slice(0, 3)) {
     const available = (availMap.get(p.id) || 0) > 0;
     const tmplId = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
     const tmpl = await odooGetTemplateDetails(tmplId);
@@ -584,7 +729,7 @@ async function tool_get_product_details(args, sess) {
   const bestCat = items.find((x) => x.category)?.category || null;
   if (bestCat) sess.lastCategory = bestCat;
 
-  return { ok: true, found: products.length, items };
+  return { ok: true, found: ranked.length, items };
 }
 
 async function callToolByName(name, args, sess) {
@@ -661,7 +806,7 @@ async function runAgent({ from, userText }) {
   }
 
   const fallback =
-    "Estoy revisando opciones, pero necesito un detalle adicional para afinar. ¿Es para interior o exterior y prefieres huella o clave?";
+    "Estoy revisando opciones, pero necesito un detalle adicional para afinar. ¿Me confirmas el modelo exacto y si lo quieres con táctil?";
   dlog("🤖 Reply to user (max loops reached):", fallback);
   return fallback;
 }
