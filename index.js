@@ -24,7 +24,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 const OPTIONS_LIMIT = Number(process.env.OPTIONS_LIMIT || 12);
-const MAX_TOOL_LOOPS = Number(process.env.MAX_TOOL_LOOPS || 4);
+const MAX_TOOL_LOOPS = Number(process.env.MAX_TOOL_LOOPS || 5);
 const DEBUG = String(process.env.DEBUG || "true").toLowerCase() !== "false";
 
 function dlog(...args) {
@@ -35,6 +35,21 @@ if (!OPENAI_API_KEY) {
   console.warn("⚠️ Falta OPENAI_API_KEY. El bot seguirá, pero sin IA no hará tool-calling.");
 }
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+/* =========================
+   CONFIG: links / pagos
+========================= */
+const LOCKS_FB_SOURCE =
+  "https://www.facebook.com/bkglobal.com.co/posts/pfbid0v6LpXxdHUky7gH1KZksJowQcM3HGZ1j59vDdAS78s87yXXPj4kPYuzyxrATTWKxql";
+
+const PAY_WOMPI_URL = "https://checkout.wompi.co/l/VPOS_6LIOMn";
+const PAY_BANCOLOMBIA = {
+  bank: "Bancolombia",
+  type: "Ahorros",
+  account: "23600005240",
+  nit: "901800875",
+  name: "BK GLOBAL SAS",
+};
 
 /* =========================
    Helpers
@@ -54,7 +69,10 @@ function norm(s = "") {
 }
 
 function stripPunct(s = "") {
-  return String(s).replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+  return String(s)
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function moneyCOP(n) {
@@ -77,34 +95,10 @@ function safeJsonStringify(obj) {
   }
 }
 
-function pick(arr, n) {
-  return Array.isArray(arr) ? arr.slice(0, Math.max(0, n)) : [];
-}
-
 function truncateWhatsApp(text, max = 1600) {
   const t = String(text || "");
   if (t.length <= max) return t;
   return t.slice(0, max - 10) + "\n…(cortado)";
-}
-
-function shortToolResult(result) {
-  if (!result || typeof result !== "object") return result;
-  const r = { ...result };
-  if (Array.isArray(r.items)) {
-    r.items_total = r.items.length;
-    r.items = r.items.slice(0, 3).map((x) => ({
-      name: x.name,
-      code: x.code,
-      in_stock: x.in_stock,
-      price_cop: x.price_cop,
-      category: x.category,
-    }));
-    r.items_preview = true;
-  }
-  if (r.description && String(r.description).length > 220) {
-    r.description = String(r.description).slice(0, 220) + "…";
-  }
-  return r;
 }
 
 function cleanWhatsAppText(text) {
@@ -128,29 +122,63 @@ function includesAny(hay, words) {
 }
 
 /* =========================
-   ✅ Stopwords + Query simplifier (mejorado)
+   ✅ Query simplifier
 ========================= */
 const STOPWORDS_ES = new Set([
-  "tienes","tiene","hay","precio","precios","valor","vale","cuanto","cuánto","me","das","dame",
-  "de","del","la","el","los","las","un","una","unos","unas","para","por","y","o","en","con",
-  "quiero","necesito","busco","favor","porfa","porfavor","hola","buenas","buenos","dias","tardes","no"
+  "tienes",
+  "tiene",
+  "hay",
+  "precio",
+  "precios",
+  "valor",
+  "vale",
+  "cuanto",
+  "cuánto",
+  "me",
+  "das",
+  "dame",
+  "de",
+  "del",
+  "la",
+  "el",
+  "los",
+  "las",
+  "un",
+  "una",
+  "unos",
+  "unas",
+  "para",
+  "por",
+  "y",
+  "o",
+  "en",
+  "con",
+  "quiero",
+  "necesito",
+  "busco",
+  "favor",
+  "porfa",
+  "porfavor",
+  "hola",
+  "buenas",
+  "buenos",
+  "dias",
+  "tardes",
+  "no",
 ]);
 
 function simplifySearchQuery(raw = "") {
   const x = norm(stripPunct(raw));
   if (!x) return "";
-  const tokens = x.split(" ").filter(Boolean).filter(t => !STOPWORDS_ES.has(t));
-
-  // conserva tokens tipo a10s, a20s, s21, etc
-  const keep = [];
-  for (const t of tokens) {
-    if (t.length >= 2) keep.push(t);
-  }
-  return keep.join(" ").trim();
+  const tokens = x
+    .split(" ")
+    .filter(Boolean)
+    .filter((t) => !STOPWORDS_ES.has(t));
+  return tokens.join(" ").trim();
 }
 
 /* =========================
-   ✅ Product scoring (para “display vs vidrio” etc)
+   ✅ Scoring
 ========================= */
 function tokenizeQuery(q) {
   const x = norm(q);
@@ -165,7 +193,6 @@ function detectIphoneModel(q) {
 
   const hasProMax = x.includes("pro max") || x.includes("promax");
   const hasPro = x.includes(" pro");
-
   if (hasProMax) return "iphone 11 pro max";
   if (hasPro) return "iphone 11 pro";
   return "iphone 11";
@@ -175,10 +202,8 @@ function scoreProductForQuery({ name, code }, userQuery) {
   const q = norm(userQuery);
   const n = norm(name || "");
   const c = norm(code || "");
-
   let score = 0;
 
-  // overlap tokens
   const tokens = tokenizeQuery(q);
   let overlap = 0;
   for (const t of tokens) {
@@ -187,7 +212,6 @@ function scoreProductForQuery({ name, code }, userQuery) {
   }
   score += overlap * 6;
 
-  // display preference
   const wantsDisplay = includesAny(q, ["display", "pantalla", "modulo", "tactil", "táctil"]);
   if (wantsDisplay) {
     if (includesAny(n, ["display", "pantalla"])) score += 55;
@@ -198,7 +222,6 @@ function scoreProductForQuery({ name, code }, userQuery) {
     if (isGlass && !wantsGlass) score -= 120;
   }
 
-  // iPhone 11 exactness
   const qModel = detectIphoneModel(q);
   if (qModel === "iphone 11") {
     if (includesAny(n, ["pro max", "promax"])) score -= 120;
@@ -207,7 +230,6 @@ function scoreProductForQuery({ name, code }, userQuery) {
   }
 
   if (q.length >= 4 && n.includes(q)) score += 25;
-
   return score;
 }
 
@@ -321,10 +343,7 @@ async function odooGetAvailabilityMap(productIds = []) {
   const quants = await odooExecuteKw(
     "stock.quant",
     "search_read",
-    [[
-      ["product_id", "in", ids],
-      ["location_id.usage", "=", "internal"],
-    ]],
+    [[["product_id", "in", ids], ["location_id.usage", "=", "internal"]]],
     { fields: ["product_id", "quantity", "reserved_quantity"], limit: 5000 }
   );
 
@@ -375,30 +394,7 @@ async function odooGetTemplateDetails(tmplId) {
   );
   const description = descCandidates.length ? descCandidates[0].trim() : null;
 
-  let attrs = [];
-  try {
-    const lines = await odooExecuteKw(
-      "product.template.attribute.line",
-      "search_read",
-      [[["product_tmpl_id", "=", tmplId]]],
-      { fields: ["attribute_id", "value_ids"], limit: 100 }
-    );
-
-    for (const ln of lines || []) {
-      const attrName = Array.isArray(ln.attribute_id) ? ln.attribute_id[1] : null;
-      const valueIds = Array.isArray(ln.value_ids) ? ln.value_ids : [];
-      let values = [];
-      if (valueIds.length) {
-        const vals = await odooExecuteKw("product.attribute.value", "read", [valueIds], { fields: ["name"] });
-        values = (vals || []).map((v) => v.name).filter(Boolean);
-      }
-      if (attrName) attrs.push({ name: attrName, values });
-    }
-  } catch {
-    attrs = [];
-  }
-
-  return { name: row.name || null, description, attributes: attrs };
+  return { name: row.name || null, description };
 }
 
 /* =========================
@@ -438,7 +434,6 @@ async function fetchWhatsAppImageAsDataUrl(mediaId) {
   if (!WHATSAPP_TOKEN) throw new Error("Missing WHATSAPP_TOKEN");
   if (!mediaId) throw new Error("Missing mediaId");
 
-  // 1) get media url
   const metaUrl = `https://graph.facebook.com/v22.0/${mediaId}?fields=url,mime_type`;
   const metaResp = await fetch(metaUrl, {
     headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
@@ -448,7 +443,6 @@ async function fetchWhatsAppImageAsDataUrl(mediaId) {
     throw new Error(`Failed to get media url: ${metaResp.status} ${JSON.stringify(meta)?.slice(0, 200)}`);
   }
 
-  // 2) download binary
   const binResp = await fetch(meta.url, {
     headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
   });
@@ -462,9 +456,59 @@ async function fetchWhatsAppImageAsDataUrl(mediaId) {
 }
 
 /* =========================
-   Sessions + Dedup
+   ✅ Vision extractor (TV label)
+   - Extrae MARCA + MODELO y texto clave
 ========================= */
-const sessions = new Map(); // from -> { inputItems: [], lastCategory: string|null }
+async function extractTvLabelInfo(imageDataUrl) {
+  if (!openai) return { ok: false, brand: null, model: null, raw: null };
+  try {
+    const r = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "Lee la etiqueta del TV en la imagen y devuelve SOLO JSON con: " +
+                '{ "brand": "...", "model": "...", "model_alt": "...", "raw": "..." }. ' +
+                "brand = marca (LG, Samsung, etc). model = modelo principal (ej: 55LA8600). " +
+                "model_alt = si aparece otro código útil. raw = líneas relevantes. Si no se ve, usa null.",
+            },
+            { type: "input_image", image_url: imageDataUrl },
+          ],
+        },
+      ],
+    });
+
+    const txt = (r.output_text || "").trim();
+    // intenta parsear json, si no, fallback
+    let obj = null;
+    try {
+      obj = JSON.parse(txt);
+    } catch {
+      // fallback simple: buscar LG y patron modelo
+      const raw = txt;
+      const m = raw.match(/([A-Z]{1,3})\s*([0-9]{2}[A-Z]{1,3}[0-9]{2,4})/);
+      obj = {
+        brand: raw.includes("LG") ? "LG" : null,
+        model: m ? m[2] : null,
+        model_alt: null,
+        raw,
+      };
+    }
+    return { ok: true, brand: obj.brand || null, model: obj.model || null, model_alt: obj.model_alt || null, raw: obj.raw || null };
+  } catch (e) {
+    console.error("❌ extractTvLabelInfo error:", e?.message || e);
+    return { ok: false, brand: null, model: null, model_alt: null, raw: null };
+  }
+}
+
+/* =========================
+   Sessions + Dedup + CART
+========================= */
+const sessions = new Map(); // from -> session
 const seenMsg = new Map();
 const SEEN_TTL = 10 * 60 * 1000;
 
@@ -480,7 +524,15 @@ function seenBefore(msgId) {
 }
 
 function getSession(from) {
-  if (!sessions.has(from)) sessions.set(from, { inputItems: [], lastCategory: null });
+  if (!sessions.has(from)) {
+    sessions.set(from, {
+      inputItems: [],
+      lastCategory: null,
+      lastOptions: [], // últimas opciones devueltas por tools
+      cart: [], // {code,name,qty,price_cop,in_stock}
+      lead: { lockReferral: false, askedTech: false, pricingTier: null, sourceUrl: null },
+    });
+  }
   return sessions.get(from);
 }
 
@@ -489,69 +541,106 @@ function resetSession(from) {
 }
 
 /* =========================
-   ✅ PROMPT: Reglas por categoría + pagos + imágenes
+   ✅ Cart helpers
+========================= */
+function cartAddItem(sess, item, qty = 1) {
+  const q = Math.max(1, Number(qty || 1));
+  const code = item?.code || null;
+  if (!code) return false;
+
+  const existing = sess.cart.find((x) => x.code === code);
+  if (existing) existing.qty += q;
+  else sess.cart.push({ code, name: item.name || "", qty: q, price_cop: item.price_cop || null, in_stock: !!item.in_stock });
+  return true;
+}
+
+function cartTotalCOP(sess) {
+  let total = 0;
+  for (const it of sess.cart) {
+    const p = Number(String(it.price_cop || "").replace(/\./g, "").replace(/\$/g, "")) || 0;
+    total += p * (Number(it.qty) || 1);
+  }
+  return total;
+}
+
+function cartSummaryText(sess) {
+  if (!sess.cart.length) return "Tu carrito está vacío por ahora.";
+  let out = "Resumen de tu pedido:\n";
+  let i = 1;
+  for (const it of sess.cart) {
+    const stock = it.in_stock ? "✅ Hay" : "❌ No hay";
+    const price = it.price_cop ? it.price_cop : "Precio: no disponible";
+    out += `${i}) [${it.code}] ${it.name} — ${price} — x${it.qty} — ${stock}\n`;
+    i++;
+  }
+  const total = cartTotalCOP(sess);
+  if (total > 0) out += `\nTotal: ${moneyCOP(total)}`;
+  return out.trim();
+}
+
+function isAddMoreIntent(text) {
+  const x = norm(text);
+  return (
+    x.startsWith("espera tambien") ||
+    x.startsWith("espera también") ||
+    x.includes("tambien necesito") ||
+    x.includes("también necesito") ||
+    x.includes("ademas necesito") ||
+    x.includes("además necesito") ||
+    x.includes("agrega") ||
+    x.includes("añade") ||
+    x.includes("sumale") ||
+    x.includes("súmale")
+  );
+}
+
+/* =========================
+   ✅ PROMPT (reglas + códigos + carrito + no mezclar categorías)
 ========================= */
 const BK_PROMPT = `
 Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
 No inventes nada. Usa SOLO lo que llega de herramientas (tools) para productos/precios/stock.
 
-CAPACIDAD DE IMÁGENES:
-- SI el cliente envía una foto de etiqueta (TV), debes LEER el texto visible.
-- Extrae el "MODELO" exacto (y si aparece, "CÓDIGO / SERIAL").
-- Luego con ese modelo, consulta Odoo (tools) para cotizar tiras LED.
-- Nunca digas que “no puedes ver imágenes”.
+FORMATO OBLIGATORIO DE OPCIONES (siempre):
+- Muestra SIEMPRE: [CODIGO] NOMBRE — PRECIO — ✅ Hay / ❌ No hay
+- Nunca muestres opciones sin código.
 
-OBJETIVO:
-- Entender necesidad por categoría, pedir lo mínimo.
-- Cuando ya esté claro, consultar Odoo y cotizar.
+CARRITO:
+- Si el cliente confirma algo (por código, por “la primera”, “esa”, “me llevo X”), debes usar tools de carrito.
+- Si el cliente dice “espera también necesito…”, NO cierres: agrega al carrito y luego muestra resumen + total.
 
-REGLAS GLOBALES:
-1) Siempre consulta Odoo (tools) cuando pidan: opciones, precio, disponibilidad o características.
-2) Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
-3) Precio: solo si viene real; si no hay precio real, dilo.
-4) Respuestas WhatsApp: cortas, claras, sin markdown.
-5) Si hay varias opciones válidas, muestra TODAS con precio y stock (no obligues a elegir antes de ver precios).
-6) Si NO se encuentra un producto pero el cliente dio un modelo claro (ej: “A10s”), intenta variaciones:
-   - Busca por: "A10S", "A10 S", "SM-A107", "A10s A20s A21", etc (usando tools).
+IMÁGENES / ETIQUETAS (TIRAS LED):
+- Si llega foto de etiqueta, usa la información extraída (marca + modelo) y cotiza.
+- Si no se ve el modelo, pide otra foto más cerca o que escriba el modelo.
 
 REGLAS POR CATEGORÍA:
-
 A) REPUESTOS CELULARES / TABLETS:
-- Primero identifica: (1) Modelo exacto (2) Repuesto exacto.
-- Si ya lo dieron, cotiza.
-
+- Pide modelo exacto + repuesto exacto si no está claro.
 B) TIRAS LED:
-- Pide modelo exacto del TV o foto etiqueta.
-- Si llega foto, lee el modelo y cotiza.
-
+- Requiere modelo exacto del TV (de etiqueta). Cotiza con ese modelo.
 C) REPUESTOS VIDEOJUEGOS:
 - Pide consola exacta + repuesto (o código).
-
 D) GPS (solo B2B):
-- Antes de cotizar: "¿Eres empresa de rastreo o técnico instalador?"
-- Si dice que no, explica que GPS es solo para esos perfiles.
+- Antes de cotizar: “¿Eres empresa de rastreo o técnico instalador?”
+- Si no, explica que GPS es solo para esos perfiles.
+E) CERRADURAS DIGITALES:
+- Si piden cerradura, NO ofrezcas intercomunicadores.
+- Puedes asesorar con 3-8 opciones.
+F) INTERCOMUNICADORES:
+- Si piden intercom, NO ofrezcas cerraduras.
 
-E) INTERCOMUNICADORES y CERRADURAS DIGITALES:
-- Puedes asesorar y mostrar 3-8 opciones.
-- Pregunta lo mínimo (interior/exterior, huella/clave/app, etc).
+REGLAS DISPLAY/PANTALLA:
+- Si piden display/pantalla, prioriza DISPLAY/PANTALLA y descarta VIDRIO/VISOR/CRISTAL/GLASS/PROTECTOR/LENTE salvo que lo pidan.
 
-REGLAS 'DISPLAY/PANTALLA':
-- Si piden display/pantalla, prioriza DISPLAY/PANTALLA y descarta VIDRIO/VISOR/CRISTAL/GLASS/PROTECTOR/LENTE a menos que lo pidan.
+CIERRE DE COMPRA (cuando el cliente diga “proceder”, “comprar”, “confirmo”, o ya haya carrito):
+- Ofrece SIEMPRE:
+  1) Contraentrega: paga la totalidad + envío al recibir en la puerta.
+  2) Wompi: ${PAY_WOMPI_URL}
+  3) Transferencia Bancolombia: Bancolombia Ahorros ${PAY_BANCOLOMBIA.account} — NIT ${PAY_BANCOLOMBIA.nit} — ${PAY_BANCOLOMBIA.name}
+- Luego pide: nombre, ciudad, dirección, barrio y teléfono.
 
-CIERRE DE COMPRA:
-Cuando el cliente diga "proceder", "comprar", "confirmo", "hagamos el pedido", o ya eligió productos:
-- Ofrece métodos de pago SIEMPRE:
-  1) Contraentrega: paga la totalidad + envío al recibir en la puerta (más confiabilidad).
-  2) Wompi: https://checkout.wompi.co/l/VPOS_6LIOMn
-  3) Transferencia Bancolombia:
-     Bancolombia Ahorros 23600005240
-     NIT 901800875
-     BK GLOBAL SAS
-- Luego pide: nombre, ciudad, dirección, barrio, teléfono, y confirma productos.
-
-FORMATO COTIZACIÓN:
-✅ Tengo estas opciones:
-• Nombre — Precio — ✅ Hay / ❌ No hay
+NOTA: Si hay “lead de cerraduras” y aún no se sabe si es técnico, pregunta primero:
+“¿Eres técnico instalador?” para definir precio punto o cliente final.
 `;
 
 /* =========================
@@ -592,30 +681,73 @@ const tools = [
   },
   {
     type: "function",
-    name: "get_restock_eta",
-    description: "Devuelve ETA si existe; si no, devuelve unknown coherente.",
+    name: "get_product_details",
+    description: "Obtiene características reales del producto desde Odoo (descripción) usando código o texto.",
     parameters: {
       type: "object",
       properties: {
-        category_name: { type: ["string", "null"], description: "Categoría o null" },
-        product_code: { type: ["string", "null"], description: "Código Odoo o null" },
+        query: { type: "string", description: "Código o texto del producto" },
+        limit: { type: "integer", description: "Máximo coincidencias (normal 3-5)" },
       },
-      required: ["category_name", "product_code"],
+      required: ["query", "limit"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+
+  // ✅ Carrito
+  {
+    type: "function",
+    name: "cart_add_last_option",
+    description: "Agrega al carrito una opción de la última lista mostrada (por posición 1..N).",
+    parameters: {
+      type: "object",
+      properties: {
+        position: { type: "integer", description: "Posición en la lista (1 = primera)" },
+        qty: { type: "integer", description: "Cantidad" },
+      },
+      required: ["position", "qty"],
       additionalProperties: false,
     },
     strict: true,
   },
   {
     type: "function",
-    name: "get_product_details",
-    description: "Obtiene características reales del producto desde Odoo (descripción/atributos) usando código o texto.",
+    name: "cart_add_by_code",
+    description: "Agrega al carrito por código exacto (si existe en últimas opciones, lo usa; si no, busca en Odoo).",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Código (ej CD104) o texto del producto" },
-        limit: { type: "integer", description: "Máximo coincidencias (normal 3-5)" },
+        code: { type: "string", description: "Código del producto (default_code)" },
+        qty: { type: "integer", description: "Cantidad" },
       },
-      required: ["query", "limit"],
+      required: ["code", "qty"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "cart_get_summary",
+    description: "Devuelve resumen del carrito y total.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "cart_clear",
+    description: "Vacía el carrito.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "set_pricing_tier",
+    description: "Guarda si el cliente es técnico (precio punto) o cliente final.",
+    parameters: {
+      type: "object",
+      properties: { tier: { type: "string", enum: ["technician", "final"] } },
+      required: ["tier"],
       additionalProperties: false,
     },
     strict: true,
@@ -634,7 +766,7 @@ async function tool_list_products_by_category(args, sess) {
   if (!category_name) return { ok: false, error: "category_name vacío" };
   sess.lastCategory = category_name;
 
-  const fetchLimit = Math.min(Math.max(limit * 5, 20), 60);
+  const fetchLimit = Math.min(Math.max(limit * 5, 20), 80);
 
   const products = await odooSearchProductsByCategory({
     categoryName: category_name,
@@ -642,24 +774,34 @@ async function tool_list_products_by_category(args, sess) {
     limit: fetchLimit,
   });
 
-  if (!products.length) return { ok: true, category_name, count: 0, items: [] };
+  if (!products.length) {
+    sess.lastOptions = [];
+    return { ok: true, category_name, count: 0, items: [] };
+  }
 
   const ids = products.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
 
-  const items = products.map((p) => {
-    const available = (availMap.get(p.id) || 0) > 0;
-    const priceOk = shouldShowPrice(p.list_price);
-    return {
-      id: p.id,
-      name: p.display_name,
-      code: p.default_code || null,
-      price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
-      in_stock: !!available,
-      category: getCategoryName(p) || category_name,
-      _score: query ? scoreProductForQuery({ name: p.display_name, code: p.default_code }, query) : 0,
-    };
-  });
+  const items = products
+    .map((p) => {
+      const available = (availMap.get(p.id) || 0) > 0;
+      const priceOk = shouldShowPrice(p.list_price);
+      return {
+        id: p.id,
+        name: p.display_name,
+        code: p.default_code || null,
+        price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
+        in_stock: !!available,
+        category: getCategoryName(p) || category_name,
+        _score: query ? scoreProductForQuery({ name: p.display_name, code: p.default_code }, query) : 0,
+      };
+    })
+    .filter((x) => x.code); // ✅ solo items con código
+
+  if (!items.length) {
+    sess.lastOptions = [];
+    return { ok: true, category_name, count: 0, items: [] };
+  }
 
   let filtered = items;
   if (availability === "in_stock") filtered = items.filter((x) => x.in_stock);
@@ -679,12 +821,13 @@ async function tool_list_products_by_category(args, sess) {
     filtered = [...inS, ...outS];
   }
 
-  filtered = pick(filtered, Math.min(Math.max(limit, 1), 60)).map((x) => {
+  filtered = filtered.slice(0, Math.min(Math.max(limit, 1), 30)).map((x) => {
     const y = { ...x };
     delete y._score;
     return y;
   });
 
+  sess.lastOptions = filtered; // ✅ para "la primera"
   return { ok: true, category_name, count: filtered.length, items: filtered };
 }
 
@@ -693,65 +836,60 @@ async function tool_search_products(args, sess) {
   const limit = Number(args?.limit || OPTIONS_LIMIT);
   if (!rawQuery) return { ok: false, error: "query vacío" };
 
-  // ✅ claves: buscar varias variaciones (arreglo para A10s, baterías, acentos, etc.)
   const qRaw = rawQuery;
   const qNorm = norm(stripPunct(rawQuery));
   const qSimple = simplifySearchQuery(rawQuery);
 
-  const queries = [
-    qRaw,
-    qSimple,
-    qNorm,
-  ].filter(Boolean);
-
-  // extra: si contiene a10s/a20s etc, empuja variantes tipo "a10 s"
+  const queries = [qRaw, qSimple, qNorm].filter(Boolean);
   const tokens = qNorm.split(" ");
   for (const t of tokens) {
     if (/^[a-z]\d{2,3}[a-z]$/.test(t)) {
       queries.push(t);
-      queries.push(t.replace(/(\d+)/, "$1 ")); // (fallback no-op)
       queries.push(t.replace(/([a-z])(\d+)/, "$1 $2")); // a10s -> a 10s
       queries.push(t.replace(/(\d+)([a-z])$/, "$1 $2")); // 10s -> 10 s
     }
   }
 
-  const uniqQueries = [...new Set(queries.map(x => x.trim()).filter(Boolean))].slice(0, 6);
+  const uniqQueries = [...new Set(queries.map((x) => x.trim()).filter(Boolean))].slice(0, 6);
+  const fetchLimit = Math.min(Math.max(limit * 10, 60), 150);
 
-  const fetchLimit = Math.min(Math.max(limit * 10, 50), 120);
   const merged = new Map();
-
   for (const q of uniqQueries) {
     const products = await odooSearchProducts({ q, limit: fetchLimit });
     for (const p of products || []) merged.set(p.id, p);
   }
 
   const productsAll = Array.from(merged.values());
-  if (!productsAll.length) return { ok: true, count: 0, items: [] };
+  if (!productsAll.length) {
+    sess.lastOptions = [];
+    return { ok: true, count: 0, items: [] };
+  }
 
   const ids = productsAll.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
 
-  const items = productsAll.map((p) => {
-    const available = (availMap.get(p.id) || 0) > 0;
-    const priceOk = shouldShowPrice(p.list_price);
-    const product_tmpl_id = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
+  const items = productsAll
+    .map((p) => {
+      const available = (availMap.get(p.id) || 0) > 0;
+      const priceOk = shouldShowPrice(p.list_price);
+      const score = scoreProductForQuery({ name: p.display_name, code: p.default_code }, qRaw);
 
-    const score = scoreProductForQuery({ name: p.display_name, code: p.default_code }, qRaw);
+      return {
+        id: p.id,
+        name: p.display_name,
+        code: p.default_code || null,
+        price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
+        in_stock: !!available,
+        category: getCategoryName(p) || null,
+        _score: score,
+      };
+    })
+    .filter((x) => x.code); // ✅ solo items con código
 
-    return {
-      id: p.id,
-      name: p.display_name,
-      code: p.default_code || null,
-      price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
-      in_stock: !!available,
-      category: getCategoryName(p) || null,
-      product_tmpl_id,
-      _score: score,
-    };
-  });
-
-  const bestCat = items.find((x) => x.category)?.category || null;
-  if (bestCat) sess.lastCategory = bestCat;
+  if (!items.length) {
+    sess.lastOptions = [];
+    return { ok: true, count: 0, items: [] };
+  }
 
   items.sort((a, b) => {
     const sa = Number(a._score || 0);
@@ -761,28 +899,19 @@ async function tool_search_products(args, sess) {
     return 0;
   });
 
-  const sorted = [...items.filter((x) => x.in_stock), ...items.filter((x) => !x.in_stock)];
-  const finalItems = pick(sorted, Math.min(Math.max(limit, 1), 60)).map((x) => {
-    const y = { ...x };
-    delete y._score;
-    return y;
-  });
+  const sorted = [...items.filter((x) => x.in_stock), ...items.filter((x) => !x.in_stock)]
+    .slice(0, Math.min(Math.max(limit, 1), 30))
+    .map((x) => {
+      const y = { ...x };
+      delete y._score;
+      return y;
+    });
 
-  return { ok: true, count: finalItems.length, items: finalItems };
-}
+  sess.lastOptions = sorted;
+  const bestCat = sorted.find((x) => x.category)?.category || null;
+  if (bestCat) sess.lastCategory = bestCat;
 
-async function tool_get_restock_eta(args, sess) {
-  const category_name =
-    args?.category_name === null ? null : String(args?.category_name || sess.lastCategory || "").trim() || null;
-  const product_code = args?.product_code === null ? null : String(args?.product_code || "").trim() || null;
-
-  return {
-    ok: true,
-    known: false,
-    category_name,
-    product_code,
-    message: "No hay una fecha de llegada registrada en el sistema en este momento. Se puede verificar con compras/proveedor.",
-  };
+  return { ok: true, count: sorted.length, items: sorted };
 }
 
 async function tool_get_product_details(args, sess) {
@@ -790,7 +919,6 @@ async function tool_get_product_details(args, sess) {
   const limit = Number(args?.limit || 3);
   if (!raw) return { ok: false, error: "query vacío" };
 
-  // ✅ doble búsqueda para evitar fallos por acentos / formas
   const q1 = raw;
   const q2 = norm(stripPunct(raw));
   const q3 = simplifySearchQuery(raw);
@@ -815,12 +943,14 @@ async function tool_get_product_details(args, sess) {
   const availMap = await odooGetAvailabilityMap(ids);
 
   const items = [];
-  for (const p of ranked.slice(0, Math.min(3, ranked.length))) {
+  for (const p of ranked.slice(0, Math.min(limit, ranked.length))) {
     const available = (availMap.get(p.id) || 0) > 0;
     const tmplId = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
     const tmpl = await odooGetTemplateDetails(tmplId);
 
     const priceOk = shouldShowPrice(p.list_price);
+    if (!p.default_code) continue;
+
     items.push({
       name: p.display_name,
       code: p.default_code || null,
@@ -828,7 +958,6 @@ async function tool_get_product_details(args, sess) {
       price_cop: priceOk ? moneyCOP(p.list_price || 0) : null,
       category: getCategoryName(p) || null,
       description: tmpl?.description || null,
-      attributes: tmpl?.attributes || [],
     });
   }
 
@@ -838,21 +967,110 @@ async function tool_get_product_details(args, sess) {
   return { ok: true, found: ranked.length, items };
 }
 
+/* =========================
+   ✅ Cart tools
+========================= */
+async function tool_cart_add_last_option(args, sess) {
+  const pos = Number(args?.position || 0);
+  const qty = Number(args?.qty || 1);
+  if (!pos || pos < 1) return { ok: false, error: "position inválida" };
+
+  const opt = (sess.lastOptions || [])[pos - 1];
+  if (!opt) return { ok: false, error: "No existe esa opción en la última lista." };
+
+  const ok = cartAddItem(sess, opt, qty);
+  if (!ok) return { ok: false, error: "No se pudo agregar (sin código)." };
+
+  return { ok: true, cart_count: sess.cart.length, summary: cartSummaryText(sess) };
+}
+
+async function tool_cart_add_by_code(args, sess) {
+  const code = String(args?.code || "").trim();
+  const qty = Number(args?.qty || 1);
+  if (!code) return { ok: false, error: "code vacío" };
+
+  // 1) si está en lastOptions
+  const found = (sess.lastOptions || []).find((x) => norm(x.code) === norm(code));
+  if (found) {
+    cartAddItem(sess, found, qty);
+    return { ok: true, cart_count: sess.cart.length, summary: cartSummaryText(sess) };
+  }
+
+  // 2) buscar en Odoo por default_code exacto
+  const products = await odooExecuteKw(
+    "product.product",
+    "search_read",
+    [[["default_code", "=", code]]],
+    { fields: ["id", "display_name", "default_code", "list_price", "categ_id"], limit: 1 }
+  );
+
+  const p = Array.isArray(products) ? products[0] : null;
+  if (!p) return { ok: false, error: "No encontré ese código en Odoo." };
+
+  const availMap = await odooGetAvailabilityMap([p.id]);
+  const available = (availMap.get(p.id) || 0) > 0;
+
+  const item = {
+    id: p.id,
+    name: p.display_name,
+    code: p.default_code,
+    price_cop: shouldShowPrice(p.list_price) ? moneyCOP(p.list_price || 0) : null,
+    in_stock: !!available,
+    category: getCategoryName(p) || null,
+  };
+  cartAddItem(sess, item, qty);
+
+  return { ok: true, cart_count: sess.cart.length, summary: cartSummaryText(sess) };
+}
+
+async function tool_cart_get_summary(_args, sess) {
+  return { ok: true, cart_count: sess.cart.length, summary: cartSummaryText(sess) };
+}
+
+async function tool_cart_clear(_args, sess) {
+  sess.cart = [];
+  return { ok: true, cart_count: 0, summary: "Listo 👍 Carrito vaciado." };
+}
+
+async function tool_set_pricing_tier(args, sess) {
+  const tier = String(args?.tier || "");
+  if (!["technician", "final"].includes(tier)) return { ok: false, error: "tier inválido" };
+  sess.lead.pricingTier = tier;
+  sess.lead.askedTech = true;
+  return { ok: true, pricing_tier: tier };
+}
+
 async function callToolByName(name, args, sess) {
   if (name === "list_products_by_category") return await tool_list_products_by_category(args, sess);
   if (name === "search_products") return await tool_search_products(args, sess);
-  if (name === "get_restock_eta") return await tool_get_restock_eta(args, sess);
   if (name === "get_product_details") return await tool_get_product_details(args, sess);
+
+  if (name === "cart_add_last_option") return await tool_cart_add_last_option(args, sess);
+  if (name === "cart_add_by_code") return await tool_cart_add_by_code(args, sess);
+  if (name === "cart_get_summary") return await tool_cart_get_summary(args, sess);
+  if (name === "cart_clear") return await tool_cart_clear(args, sess);
+  if (name === "set_pricing_tier") return await tool_set_pricing_tier(args, sess);
+
   return { ok: false, error: `Tool desconocida: ${name}` };
 }
 
 /* =========================
-   ✅ OpenAI Agent Loop (Responses API) — soporta imágenes
+   ✅ OpenAI Agent Loop (Responses API)
 ========================= */
 async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = "" }) {
   if (!openai) return "Hola 👋 En este momento no tengo IA activa (falta OPENAI_API_KEY). ¿Qué producto buscas?";
 
   const sess = getSession(from);
+
+  // ✅ Inyectar nota de referral (solo una vez)
+  if (sess.lead.lockReferral && !sess.lead._noteInjected) {
+    sess.inputItems.push({
+      role: "user",
+      content:
+        "NOTA INTERNA: El cliente llegó desde un enlace/anuncio de CERRADURAS. Antes de dar precio de cerraduras, pregunta: “¿Eres técnico instalador?” para definir precio punto vs cliente final.",
+    });
+    sess.lead._noteInjected = true;
+  }
 
   // input item con imagen o texto
   if (imageDataUrl) {
@@ -869,7 +1087,7 @@ async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = 
     sess.inputItems.push({ role: "user", content: String(userText || "") });
   }
 
-  if (sess.inputItems.length > 40) sess.inputItems = sess.inputItems.slice(-40);
+  if (sess.inputItems.length > 50) sess.inputItems = sess.inputItems.slice(-50);
 
   for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
     dlog(`🧠 Agent loop ${i + 1}/${MAX_TOOL_LOOPS} | model=${OPENAI_MODEL}`);
@@ -889,13 +1107,13 @@ async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = 
 
     if (Array.isArray(response.output) && response.output.length) {
       sess.inputItems.push(...response.output);
-      if (sess.inputItems.length > 60) sess.inputItems = sess.inputItems.slice(-60);
+      if (sess.inputItems.length > 80) sess.inputItems = sess.inputItems.slice(-80);
     }
 
     const toolCalls = (response.output || []).filter((it) => it.type === "function_call");
     if (!toolCalls.length) {
       const out = cleanWhatsAppText((response.output_text || "").trim());
-      const finalText = out || "Listo 👍 ¿Me confirmas qué estás buscando exactamente para recomendarte opciones?";
+      const finalText = out || "Listo 👍 ¿Qué repuesto necesitas y para qué modelo?";
       dlog("🤖 Reply to user:", finalText);
       return finalText;
     }
@@ -914,7 +1132,7 @@ async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = 
       }
 
       const result = await callToolByName(tc.name, args, sess);
-      dlog("🧰 toolResult:", tc.name, shortToolResult(result));
+      dlog("🧰 toolResult:", tc.name, result?.summary ? { ...result, summary: String(result.summary).slice(0, 300) } : result);
 
       sess.inputItems.push({
         type: "function_call_output",
@@ -923,13 +1141,10 @@ async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = 
       });
     }
 
-    if (sess.inputItems.length > 80) sess.inputItems = sess.inputItems.slice(-80);
+    if (sess.inputItems.length > 110) sess.inputItems = sess.inputItems.slice(-110);
   }
 
-  const fallback =
-    "Para cotizarte bien necesito un dato adicional. ¿Me confirmas el modelo exacto y qué repuesto necesitas?";
-  dlog("🤖 Reply to user (max loops reached):", fallback);
-  return fallback;
+  return "Para ayudarte bien, dime el modelo exacto y qué necesitas. Si es tiras LED, envíame la foto de la etiqueta del TV.";
 }
 
 /* =========================
@@ -1003,6 +1218,18 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    const sess = getSession(from);
+
+    // ✅ Referral (Click-to-WhatsApp)
+    const referralUrl = msg?.referral?.source_url || msg?.context?.referral?.source_url || null;
+    if (referralUrl) {
+      sess.lead.sourceUrl = referralUrl;
+      if (referralUrl.includes("facebook.com/bkglobal.com.co/posts/") || referralUrl === LOCKS_FB_SOURCE) {
+        sess.lead.lockReferral = true;
+      }
+      dlog("🔗 Referral detected:", referralUrl, "lockReferral=", sess.lead.lockReferral);
+    }
+
     // TEXT
     if (type === "text") {
       const text = msg?.text?.body || "";
@@ -1011,9 +1238,8 @@ app.post("/webhook", async (req, res) => {
       dlog("✅ Incoming text:", { from, text, msgId });
 
       if (isGreeting(text)) {
-        resetSession(from);
-        const hi =
-          "¡Hola! 😄 Soy BK GLOBAL IA. ¿Qué necesitas hoy? (ej: repuesto celular/tablet, GPS, tiras LED, repuesto videojuego, intercom, cerradura)";
+        // no resetea carrito automáticamente; solo reinicia si el usuario lo pide
+        const hi = "¡Hola! 😄 ¿Qué te puedo ayudar el día de hoy?";
         await sendWhatsAppText(from, hi);
         return;
       }
@@ -1024,6 +1250,9 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppText(from, rr);
         return;
       }
+
+      // ✅ Si el cliente dice "espera también necesito", mantenemos carrito vivo
+      // (El prompt + tools ya lo suman. Aquí no hacemos nada extra, solo NO reseteamos.)
 
       const reply = await runAgent({ from, userText: text });
       await sendWhatsAppText(from, reply);
@@ -1050,13 +1279,27 @@ app.post("/webhook", async (req, res) => {
         return;
       }
 
-      const hint = "Si es una etiqueta de TV para tiras LED: extrae el MODELO exacto y úsalo para cotizar.";
-      const reply = await runAgent({ from, userText: caption || "El cliente envió una imagen.", imageDataUrl: dataUrl, imageHint: hint });
+      // ✅ Doble paso: primero extrae marca+modelo (mejor precisión)
+      const info = await extractTvLabelInfo(dataUrl);
+      const modelText =
+        info?.ok && (info.model || info.model_alt)
+          ? `Etiqueta leída: Marca=${info.brand || "N/D"}, Modelo=${info.model || "N/D"}${info.model_alt ? `, Alt=${info.model_alt}` : ""}.`
+          : "No logré leer el modelo con claridad en la etiqueta.";
+
+      const hint = `Si es etiqueta de TV para tiras LED: usa el MODELO exacto. ${modelText} ${info.raw ? `Texto relevante: ${info.raw}` : ""}`;
+
+      const reply = await runAgent({
+        from,
+        userText: caption || "El cliente envió una imagen de etiqueta.",
+        imageDataUrl: dataUrl,
+        imageHint: hint,
+      });
+
       await sendWhatsAppText(from, reply);
       return;
     }
 
-    // fallback for other message types
+    // fallback other types
     dlog("ℹ️ Incoming message type not handled:", type);
     await sendWhatsAppText(from, "Recibí tu mensaje. ¿Me lo puedes escribir en texto para ayudarte más rápido?");
   } catch (err) {
