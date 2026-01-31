@@ -53,6 +53,10 @@ function norm(s = "") {
     .trim();
 }
 
+function stripPunct(s = "") {
+  return String(s).replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+}
+
 function moneyCOP(n) {
   const x = Math.round(Number(n || 0));
   if (!isFinite(x)) return null;
@@ -118,25 +122,44 @@ function cleanWhatsAppText(text) {
   return out.join("\n").trim();
 }
 
-/* =========================
-   ✅ Query parsing + scoring
-========================= */
-function tokenizeQuery(q) {
-  const x = norm(q);
-  const tokens = x.split(" ").filter(Boolean);
-  return tokens;
-}
-
 function includesAny(hay, words) {
   const h = norm(hay);
   return words.some((w) => h.includes(norm(w)));
 }
 
+/* =========================
+   ✅ Stopwords + Query simplifier (mejorado)
+========================= */
+const STOPWORDS_ES = new Set([
+  "tienes","tiene","hay","precio","precios","valor","vale","cuanto","cuánto","me","das","dame",
+  "de","del","la","el","los","las","un","una","unos","unas","para","por","y","o","en","con",
+  "quiero","necesito","busco","favor","porfa","porfavor","hola","buenas","buenos","dias","tardes","no"
+]);
+
+function simplifySearchQuery(raw = "") {
+  const x = norm(stripPunct(raw));
+  if (!x) return "";
+  const tokens = x.split(" ").filter(Boolean).filter(t => !STOPWORDS_ES.has(t));
+
+  // conserva tokens tipo a10s, a20s, s21, etc
+  const keep = [];
+  for (const t of tokens) {
+    if (t.length >= 2) keep.push(t);
+  }
+  return keep.join(" ").trim();
+}
+
+/* =========================
+   ✅ Product scoring (para “display vs vidrio” etc)
+========================= */
+function tokenizeQuery(q) {
+  const x = norm(q);
+  return x.split(" ").filter(Boolean);
+}
+
 function detectIphoneModel(q) {
   const x = norm(q);
-  const hasIphone = x.includes("iphone");
-  if (!hasIphone) return null;
-
+  if (!x.includes("iphone")) return null;
   const has11 = x.includes(" 11") || x.includes("11 ");
   if (!has11) return "iphone";
 
@@ -155,73 +178,37 @@ function scoreProductForQuery({ name, code }, userQuery) {
 
   let score = 0;
 
+  // overlap tokens
   const tokens = tokenizeQuery(q);
   let overlap = 0;
   for (const t of tokens) {
     if (t.length < 2) continue;
     if (n.includes(t) || c.includes(t)) overlap += 1;
   }
-  score += overlap * 5;
+  score += overlap * 6;
 
+  // display preference
   const wantsDisplay = includesAny(q, ["display", "pantalla", "modulo", "tactil", "táctil"]);
   if (wantsDisplay) {
-    if (includesAny(n, ["display", "pantalla"])) score += 40;
-    if (includesAny(n, ["tactil", "táctil", "incell", "oled", "lcd"])) score += 10;
+    if (includesAny(n, ["display", "pantalla"])) score += 55;
+    if (includesAny(n, ["tactil", "táctil", "incell", "oled", "lcd"])) score += 15;
 
     const wantsGlass = includesAny(q, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
     const isGlass = includesAny(n, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
-    if (isGlass && !wantsGlass) score -= 60;
+    if (isGlass && !wantsGlass) score -= 120;
   }
 
+  // iPhone 11 exactness
   const qModel = detectIphoneModel(q);
   if (qModel === "iphone 11") {
-    if (includesAny(n, ["pro max", "promax"])) score -= 50;
-    else if (includesAny(n, [" pro"])) score -= 30;
-    else score += 10;
-  } else if (qModel === "iphone 11 pro") {
-    if (includesAny(n, ["pro max", "promax"])) score -= 30;
-    if (includesAny(n, [" iphone 11 "]) && !includesAny(n, [" pro"])) score -= 10;
-    if (includesAny(n, [" pro"])) score += 10;
-  } else if (qModel === "iphone 11 pro max") {
-    if (includesAny(n, ["pro max", "promax"])) score += 15;
-    else score -= 10;
+    if (includesAny(n, ["pro max", "promax"])) score -= 120;
+    else if (includesAny(n, [" pro"])) score -= 80;
+    else score += 15;
   }
 
   if (q.length >= 4 && n.includes(q)) score += 25;
+
   return score;
-}
-
-/* =========================
-   ✅ NEW: stopwords + query simplifier
-========================= */
-const STOPWORDS_ES = new Set([
-  "tienes","tiene","hay","precio","precios","valor","vale","cuanto","cuánto","me","das","dame",
-  "de","del","la","el","los","las","un","una","unos","unas","para","por","y","o","en","con",
-  "quiero","necesito","busco","favor","porfa","porfavor","hola","buenas","buenos","dias","tardes","no"
-]);
-
-function stripPunct(s="") {
-  return String(s).replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-}
-
-function simplifySearchQuery(raw="") {
-  const x = norm(stripPunct(raw));
-  if (!x) return "";
-  const tokens = x.split(" ").filter(Boolean).filter(t => !STOPWORDS_ES.has(t));
-
-  const keep = [];
-  for (const t of tokens) {
-    if (t === "11" || t === "12" || t === "13" || t === "14" || t === "15") keep.push(t);
-    else if (t.length >= 3) keep.push(t);
-  }
-
-  const model = detectIphoneModel(x);
-  const wantsDisplay = includesAny(x, ["display","pantalla","modulo","tactil","táctil"]);
-
-  if (model && wantsDisplay) return `display ${model}`;
-  if (model) return model;
-
-  return keep.join(" ").trim();
 }
 
 /* =========================
@@ -360,7 +347,7 @@ function getCategoryName(product) {
 }
 
 /* =========================
-   ✅ FIX: Template details (safe fields)
+   Template details
 ========================= */
 async function odooGetTemplateDetails(tmplId) {
   if (!tmplId) return null;
@@ -445,9 +432,39 @@ async function sendWhatsAppText(to, text) {
 }
 
 /* =========================
+   ✅ WhatsApp Media (images) -> base64 data URL
+========================= */
+async function fetchWhatsAppImageAsDataUrl(mediaId) {
+  if (!WHATSAPP_TOKEN) throw new Error("Missing WHATSAPP_TOKEN");
+  if (!mediaId) throw new Error("Missing mediaId");
+
+  // 1) get media url
+  const metaUrl = `https://graph.facebook.com/v22.0/${mediaId}?fields=url,mime_type`;
+  const metaResp = await fetch(metaUrl, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+  });
+  const meta = await metaResp.json().catch(() => null);
+  if (!metaResp.ok || !meta?.url) {
+    throw new Error(`Failed to get media url: ${metaResp.status} ${JSON.stringify(meta)?.slice(0, 200)}`);
+  }
+
+  // 2) download binary
+  const binResp = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+  });
+  if (!binResp.ok) throw new Error(`Failed to download media: ${binResp.status}`);
+  const arrayBuf = await binResp.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
+
+  const mime = meta.mime_type || "image/jpeg";
+  const b64 = buf.toString("base64");
+  return `data:${mime};base64,${b64}`;
+}
+
+/* =========================
    Sessions + Dedup
 ========================= */
-const sessions = new Map();
+const sessions = new Map(); // from -> { inputItems: [], lastCategory: string|null }
 const seenMsg = new Map();
 const SEEN_TTL = 10 * 60 * 1000;
 
@@ -472,83 +489,73 @@ function resetSession(from) {
 }
 
 /* =========================
-   ✅ PROMPT: Reglas por categoría BK GLOBAL
+   ✅ PROMPT: Reglas por categoría + pagos + imágenes
 ========================= */
 const BK_PROMPT = `
 Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
-No inventes nada. Usa SOLO lo que llega de herramientas (tools) para precios/stock/productos.
+No inventes nada. Usa SOLO lo que llega de herramientas (tools) para productos/precios/stock.
 
-META:
-- Entender la necesidad por categoría.
-- Pedir la información mínima necesaria.
+CAPACIDAD DE IMÁGENES:
+- SI el cliente envía una foto de etiqueta (TV), debes LEER el texto visible.
+- Extrae el "MODELO" exacto (y si aparece, "CÓDIGO / SERIAL").
+- Luego con ese modelo, consulta Odoo (tools) para cotizar tiras LED.
+- Nunca digas que “no puedes ver imágenes”.
+
+OBJETIVO:
+- Entender necesidad por categoría, pedir lo mínimo.
 - Cuando ya esté claro, consultar Odoo y cotizar.
 
-CATEGORÍAS DE LA EMPRESA (orientación):
-- REPUESTOS CELULARES
-- GPS
-- TIRAS LED
-- REPUESTOS VIDEOJUEGOS
-- INTERCOMUNICADORES
-- CERRADURAS DIGITALES
-- REPUESTOS TABLETS
-
 REGLAS GLOBALES:
-1) Siempre consulta Odoo (tools) cuando pidan: opciones, precio, disponibilidad, características.
+1) Siempre consulta Odoo (tools) cuando pidan: opciones, precio, disponibilidad o características.
 2) Stock: solo ✅ Hay / ❌ No hay. Nunca cantidades.
 3) Precio: solo si viene real; si no hay precio real, dilo.
-4) Respuestas tipo WhatsApp: cortas, claras, sin markdown.
-5) NO inventes compatibilidades.
-6) Si hay varias opciones válidas, muestra TODAS con precio y stock en una sola respuesta (no obligues a elegir antes de ver precios).
+4) Respuestas WhatsApp: cortas, claras, sin markdown.
+5) Si hay varias opciones válidas, muestra TODAS con precio y stock (no obligues a elegir antes de ver precios).
+6) Si NO se encuentra un producto pero el cliente dio un modelo claro (ej: “A10s”), intenta variaciones:
+   - Busca por: "A10S", "A10 S", "SM-A107", "A10s A20s A21", etc (usando tools).
 
-REGLAS ESPECIALES POR CATEGORÍA:
+REGLAS POR CATEGORÍA:
 
-A) REPUESTOS CELULARES / REPUESTOS TABLETS (preguntar y guiar):
-- Objetivo: identificar el REPUESTO exacto + MODELO exacto.
-- Si el cliente dice "repuesto" o "pantalla/display/batería/cámara/puerto de carga/etc":
-  Pregunta en 1 mensaje:
-  (1) Modelo exacto (ej: iPhone 11 / Samsung A52 / iPad…)
-  (2) Qué repuesto exactamente (ej: display táctil, batería, puerto, cámara, tapa…)
-- Si el cliente ya dio modelo y repuesto, cotiza de una con tools.
+A) REPUESTOS CELULARES / TABLETS:
+- Primero identifica: (1) Modelo exacto (2) Repuesto exacto.
+- Si ya lo dieron, cotiza.
 
-B) TIRAS LED (preguntar por modelo de TV):
-- Objetivo: modelo exacto del TV.
-- Pide en 1 mensaje:
-  "¿Me confirmas el modelo exacto del TV? Si puedes, envíame una foto de la etiqueta trasera donde sale el modelo."
-- Cuando el cliente da el modelo, usa tools para buscar y cotizar.
+B) TIRAS LED:
+- Pide modelo exacto del TV o foto etiqueta.
+- Si llega foto, lee el modelo y cotiza.
 
 C) REPUESTOS VIDEOJUEGOS:
-- Pregunta primero: consola exacta + repuesto.
-  Ej: "¿Es para PS4/PS5/Nintendo Switch/Xbox? ¿Qué repuesto necesitas (lector, control, joystick, flex, HDMI, fuente…)?"
-- Si el cliente tiene código interno o referencia, acéptalo y busca con tools.
+- Pide consola exacta + repuesto (o código).
 
-D) GPS (solo B2B: empresa de rastreo o técnico instalador):
-- Antes de cotizar, pregunta:
-  "¿Eres empresa de rastreo o técnico instalador?"
-- Si no responde esa pregunta, NO avances a cotizar (solo aclara el requisito).
-- Si responde, entonces cotiza con tools y ofrece opciones.
+D) GPS (solo B2B):
+- Antes de cotizar: "¿Eres empresa de rastreo o técnico instalador?"
+- Si dice que no, explica que GPS es solo para esos perfiles.
 
-E) INTERCOMUNICADORES y CERRADURAS DIGITALES (sí asesorar y mostrar opciones):
-- Puedes ofrecer opciones sin que el cliente sepa códigos.
-- Primero pregunta SOLO lo necesario:
-  - Intercom: "¿Para moto o para uso en casa/oficina? ¿Necesitas para 1 o 2 personas?"
-  - Cerraduras: "¿Puerta principal o interior? ¿Preferencia: huella, clave, tarjeta, app? ¿Es exterior o interior?"
-- Luego muestra 3-8 opciones desde Odoo con precio y stock.
-- En estas categorías NO es obligatorio mostrar el código; úsalo solo si ayuda a diferenciar o el cliente lo pide.
+E) INTERCOMUNICADORES y CERRADURAS DIGITALES:
+- Puedes asesorar y mostrar 3-8 opciones.
+- Pregunta lo mínimo (interior/exterior, huella/clave/app, etc).
 
-REGLAS PARA 'DISPLAY / PANTALLA':
-- Si el cliente pide “display/pantalla/módulo”, prioriza productos que contengan “DISPLAY” o “PANTALLA” (y si aplica “TÁCTIL”).
-- DESCARTA “VIDRIO”, “VISOR”, “CRISTAL”, “GLASS”, “PROTECTOR”, “LENTE” a menos que el cliente lo pida explícitamente.
-- “iPhone 11” NO es lo mismo que “iPhone 11 Pro” ni “Pro Max”. Solo ofrece Pro/Pro Max si el cliente lo menciona o si NO existe el modelo exacto.
+REGLAS 'DISPLAY/PANTALLA':
+- Si piden display/pantalla, prioriza DISPLAY/PANTALLA y descarta VIDRIO/VISOR/CRISTAL/GLASS/PROTECTOR/LENTE a menos que lo pidan.
 
-FORMATO DE RESPUESTA CUANDO YA VAS A COTIZAR (obligatorio):
+CIERRE DE COMPRA:
+Cuando el cliente diga "proceder", "comprar", "confirmo", "hagamos el pedido", o ya eligió productos:
+- Ofrece métodos de pago SIEMPRE:
+  1) Contraentrega: paga la totalidad + envío al recibir en la puerta (más confiabilidad).
+  2) Wompi: https://checkout.wompi.co/l/VPOS_6LIOMn
+  3) Transferencia Bancolombia:
+     Bancolombia Ahorros 23600005240
+     NIT 901800875
+     BK GLOBAL SAS
+- Luego pide: nombre, ciudad, dirección, barrio, teléfono, y confirma productos.
+
+FORMATO COTIZACIÓN:
 ✅ Tengo estas opciones:
 • Nombre — Precio — ✅ Hay / ❌ No hay
-• ...
-¿Te interesa alguna o me confirmas un detalle para elegir la correcta?
 `;
 
 /* =========================
-   Tools (strict OK)
+   Tools
 ========================= */
 const tools = [
   {
@@ -686,22 +693,31 @@ async function tool_search_products(args, sess) {
   const limit = Number(args?.limit || OPTIONS_LIMIT);
   if (!rawQuery) return { ok: false, error: "query vacío" };
 
-  const q1 = simplifySearchQuery(rawQuery);
-
+  // ✅ claves: buscar varias variaciones (arreglo para A10s, baterías, acentos, etc.)
+  const qRaw = rawQuery;
   const qNorm = norm(stripPunct(rawQuery));
-  const model = detectIphoneModel(qNorm);
-  const wantsDisplay = includesAny(qNorm, ["display","pantalla","modulo","tactil","táctil"]);
-  const wantsGlass = includesAny(qNorm, ["vidrio","visor","cristal","glass","protector","lente"]);
+  const qSimple = simplifySearchQuery(rawQuery);
 
-  const queries = [];
-  if (q1) queries.push(q1);
-  if (model && wantsDisplay) queries.push(`display ${model}`);
-  if (model && !wantsDisplay) queries.push(model);
-  if (wantsDisplay && !model) queries.push("display");
+  const queries = [
+    qRaw,
+    qSimple,
+    qNorm,
+  ].filter(Boolean);
 
-  const uniqQueries = [...new Set(queries.filter(Boolean))].slice(0, 3);
+  // extra: si contiene a10s/a20s etc, empuja variantes tipo "a10 s"
+  const tokens = qNorm.split(" ");
+  for (const t of tokens) {
+    if (/^[a-z]\d{2,3}[a-z]$/.test(t)) {
+      queries.push(t);
+      queries.push(t.replace(/(\d+)/, "$1 ")); // (fallback no-op)
+      queries.push(t.replace(/([a-z])(\d+)/, "$1 $2")); // a10s -> a 10s
+      queries.push(t.replace(/(\d+)([a-z])$/, "$1 $2")); // 10s -> 10 s
+    }
+  }
 
-  const fetchLimit = Math.min(Math.max(limit * 8, 40), 80);
+  const uniqQueries = [...new Set(queries.map(x => x.trim()).filter(Boolean))].slice(0, 6);
+
+  const fetchLimit = Math.min(Math.max(limit * 10, 50), 120);
   const merged = new Map();
 
   for (const q of uniqQueries) {
@@ -720,25 +736,7 @@ async function tool_search_products(args, sess) {
     const priceOk = shouldShowPrice(p.list_price);
     const product_tmpl_id = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
 
-    let score = scoreProductForQuery(
-      { name: p.display_name, code: p.default_code },
-      rawQuery
-    );
-
-    const n = norm(p.display_name || "");
-    if (wantsDisplay) {
-      if (includesAny(n, ["display", "pantalla"])) score += 50;
-      if (includesAny(n, ["tactil", "táctil"])) score += 15;
-
-      const isGlass = includesAny(n, ["vidrio","visor","cristal","glass","protector","lente"]);
-      if (isGlass && !wantsGlass) score -= 120;
-    }
-
-    if (model === "iphone 11") {
-      if (includesAny(n, ["pro max", "promax"])) score -= 120;
-      else if (includesAny(n, [" pro"])) score -= 80;
-      else score += 20;
-    }
+    const score = scoreProductForQuery({ name: p.display_name, code: p.default_code }, qRaw);
 
     return {
       id: p.id,
@@ -764,7 +762,6 @@ async function tool_search_products(args, sess) {
   });
 
   const sorted = [...items.filter((x) => x.in_stock), ...items.filter((x) => !x.in_stock)];
-
   const finalItems = pick(sorted, Math.min(Math.max(limit, 1), 60)).map((x) => {
     const y = { ...x };
     delete y._score;
@@ -789,20 +786,28 @@ async function tool_get_restock_eta(args, sess) {
 }
 
 async function tool_get_product_details(args, sess) {
-  const query = String(args?.query || "").trim();
+  const raw = String(args?.query || "").trim();
   const limit = Number(args?.limit || 3);
-  if (!query) return { ok: false, error: "query vacío" };
+  if (!raw) return { ok: false, error: "query vacío" };
 
-  const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit * 4, 6), 12) });
-  if (!products.length) {
+  // ✅ doble búsqueda para evitar fallos por acentos / formas
+  const q1 = raw;
+  const q2 = norm(stripPunct(raw));
+  const q3 = simplifySearchQuery(raw);
+  const queries = [...new Set([q1, q2, q3].filter(Boolean))].slice(0, 3);
+
+  const merged = new Map();
+  for (const q of queries) {
+    const products = await odooSearchProducts({ q, limit: 30 });
+    for (const p of products || []) merged.set(p.id, p);
+  }
+  const productsAll = Array.from(merged.values());
+  if (!productsAll.length) {
     return { ok: true, found: 0, items: [], note: "No se encontró el producto en Odoo con ese texto/código." };
   }
 
-  const ranked = products
-    .map((p) => ({
-      p,
-      score: scoreProductForQuery({ name: p.display_name, code: p.default_code }, query),
-    }))
+  const ranked = productsAll
+    .map((p) => ({ p, score: scoreProductForQuery({ name: p.display_name, code: p.default_code }, raw) }))
     .sort((a, b) => b.score - a.score)
     .map((x) => x.p);
 
@@ -810,7 +815,7 @@ async function tool_get_product_details(args, sess) {
   const availMap = await odooGetAvailabilityMap(ids);
 
   const items = [];
-  for (const p of ranked.slice(0, 3)) {
+  for (const p of ranked.slice(0, Math.min(3, ranked.length))) {
     const available = (availMap.get(p.id) || 0) > 0;
     const tmplId = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
     const tmpl = await odooGetTemplateDetails(tmplId);
@@ -842,13 +847,28 @@ async function callToolByName(name, args, sess) {
 }
 
 /* =========================
-   OpenAI Agent Loop (Responses API)
+   ✅ OpenAI Agent Loop (Responses API) — soporta imágenes
 ========================= */
-async function runAgent({ from, userText }) {
+async function runAgent({ from, userText = "", imageDataUrl = null, imageHint = "" }) {
   if (!openai) return "Hola 👋 En este momento no tengo IA activa (falta OPENAI_API_KEY). ¿Qué producto buscas?";
 
   const sess = getSession(from);
-  sess.inputItems.push({ role: "user", content: userText });
+
+  // input item con imagen o texto
+  if (imageDataUrl) {
+    const txt = (userText || "").trim() || "Imagen enviada por el cliente.";
+    const hint = imageHint ? `\nContexto: ${imageHint}` : "";
+    sess.inputItems.push({
+      role: "user",
+      content: [
+        { type: "input_text", text: `${txt}${hint}` },
+        { type: "input_image", image_url: imageDataUrl },
+      ],
+    });
+  } else {
+    sess.inputItems.push({ role: "user", content: String(userText || "") });
+  }
+
   if (sess.inputItems.length > 40) sess.inputItems = sess.inputItems.slice(-40);
 
   for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
@@ -973,38 +993,72 @@ app.post("/webhook", async (req, res) => {
 
     const msg = messages[0];
     const from = msg?.from;
-    const text = msg?.text?.body || "";
     const msgId = msg?.id;
+    const type = msg?.type;
 
-    if (!from || !text) return;
+    if (!from) return;
 
     if (seenBefore(msgId)) {
       dlog("🔁 Duplicate message ignored:", msgId);
       return;
     }
 
-    dlog("✅ Incoming message:", { from, text, msgId });
+    // TEXT
+    if (type === "text") {
+      const text = msg?.text?.body || "";
+      if (!text) return;
 
-    if (isGreeting(text)) {
-      resetSession(from);
-      const hi =
-        "¡Hola! 😄 Soy BK GLOBAL IA. ¿Qué necesitas hoy? (ej: repuesto celular/tablet, GPS, tiras LED, repuesto videojuego, intercom, cerradura)";
-      dlog("🤖 Reply to user:", hi);
-      await sendWhatsAppText(from, hi);
+      dlog("✅ Incoming text:", { from, text, msgId });
+
+      if (isGreeting(text)) {
+        resetSession(from);
+        const hi =
+          "¡Hola! 😄 Soy BK GLOBAL IA. ¿Qué necesitas hoy? (ej: repuesto celular/tablet, GPS, tiras LED, repuesto videojuego, intercom, cerradura)";
+        await sendWhatsAppText(from, hi);
+        return;
+      }
+
+      if (isReset(text)) {
+        resetSession(from);
+        const rr = "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando?";
+        await sendWhatsAppText(from, rr);
+        return;
+      }
+
+      const reply = await runAgent({ from, userText: text });
+      await sendWhatsAppText(from, reply);
       return;
     }
 
-    if (isReset(text)) {
-      resetSession(from);
-      const rr = "Listo 👍 Empezamos de nuevo. ¿Qué estás buscando?";
-      dlog("🤖 Reply to user:", rr);
-      await sendWhatsAppText(from, rr);
+    // IMAGE
+    if (type === "image") {
+      const imageId = msg?.image?.id;
+      const caption = msg?.image?.caption || "";
+      dlog("✅ Incoming image:", { from, msgId, imageId, caption });
+
+      if (!imageId) {
+        await sendWhatsAppText(from, "Recibí la imagen, pero no pude leerla. ¿Me confirmas el modelo en texto por favor?");
+        return;
+      }
+
+      let dataUrl = null;
+      try {
+        dataUrl = await fetchWhatsAppImageAsDataUrl(imageId);
+      } catch (e) {
+        console.error("❌ fetchWhatsAppImageAsDataUrl error:", e?.message || e);
+        await sendWhatsAppText(from, "Recibí la imagen, pero no pude descargarla. ¿Me escribes el modelo exacto que aparece en la etiqueta?");
+        return;
+      }
+
+      const hint = "Si es una etiqueta de TV para tiras LED: extrae el MODELO exacto y úsalo para cotizar.";
+      const reply = await runAgent({ from, userText: caption || "El cliente envió una imagen.", imageDataUrl: dataUrl, imageHint: hint });
+      await sendWhatsAppText(from, reply);
       return;
     }
 
-    const reply = await runAgent({ from, userText: text });
-    dlog("🤖 Reply to user (final):", reply);
-    await sendWhatsAppText(from, reply);
+    // fallback for other message types
+    dlog("ℹ️ Incoming message type not handled:", type);
+    await sendWhatsAppText(from, "Recibí tu mensaje. ¿Me lo puedes escribir en texto para ayudarte más rápido?");
   } catch (err) {
     console.error("❌ Webhook error:", err.message || err);
   }
