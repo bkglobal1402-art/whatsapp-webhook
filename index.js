@@ -119,7 +119,7 @@ function cleanWhatsAppText(text) {
 }
 
 /* =========================
-   ✅ NEW: Query parsing + scoring
+   ✅ Query parsing + scoring
 ========================= */
 function tokenizeQuery(q) {
   const x = norm(q);
@@ -134,12 +134,11 @@ function includesAny(hay, words) {
 
 function detectIphoneModel(q) {
   const x = norm(q);
-  // detect "iphone 11", "iphone 11 pro", "iphone 11 pro max"
   const hasIphone = x.includes("iphone");
   if (!hasIphone) return null;
 
   const has11 = x.includes(" 11") || x.includes("11 ");
-  if (!has11) return "iphone"; // iphone but model unknown
+  if (!has11) return "iphone";
 
   const hasProMax = x.includes("pro max") || x.includes("promax");
   const hasPro = x.includes(" pro");
@@ -156,7 +155,6 @@ function scoreProductForQuery({ name, code }, userQuery) {
 
   let score = 0;
 
-  // Base: token overlap
   const tokens = tokenizeQuery(q);
   let overlap = 0;
   for (const t of tokens) {
@@ -165,19 +163,16 @@ function scoreProductForQuery({ name, code }, userQuery) {
   }
   score += overlap * 5;
 
-  // If user asks for display/pantalla, strongly prefer display-like products
   const wantsDisplay = includesAny(q, ["display", "pantalla", "modulo", "tactil", "táctil"]);
   if (wantsDisplay) {
     if (includesAny(n, ["display", "pantalla"])) score += 40;
     if (includesAny(n, ["tactil", "táctil", "incell", "oled", "lcd"])) score += 10;
 
-    // Penalize glass/visor unless user explicitly asks for it
     const wantsGlass = includesAny(q, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
     const isGlass = includesAny(n, ["vidrio", "visor", "cristal", "glass", "protector", "lente"]);
     if (isGlass && !wantsGlass) score -= 60;
   }
 
-  // iPhone model strictness: if user says "iphone 11" (not pro), penalize pro/pro max
   const qModel = detectIphoneModel(q);
   if (qModel === "iphone 11") {
     if (includesAny(n, ["pro max", "promax"])) score -= 50;
@@ -185,17 +180,49 @@ function scoreProductForQuery({ name, code }, userQuery) {
     else score += 10;
   } else if (qModel === "iphone 11 pro") {
     if (includesAny(n, ["pro max", "promax"])) score -= 30;
-    if (includesAny(n, [" iphone 11 "]) && !includesAny(n, [" pro"])) score -= 10; // prefer pro
+    if (includesAny(n, [" iphone 11 "]) && !includesAny(n, [" pro"])) score -= 10;
     if (includesAny(n, [" pro"])) score += 10;
   } else if (qModel === "iphone 11 pro max") {
     if (includesAny(n, ["pro max", "promax"])) score += 15;
     else score -= 10;
   }
 
-  // slight boost if query appears as a phrase
   if (q.length >= 4 && n.includes(q)) score += 25;
 
   return score;
+}
+
+/* =========================
+   ✅ NEW: stopwords + query simplifier
+========================= */
+const STOPWORDS_ES = new Set([
+  "tienes","tiene","hay","precio","precios","valor","vale","cuanto","cuánto","me","das","dame",
+  "de","del","la","el","los","las","un","una","unos","unas","para","por","y","o","en","con",
+  "quiero","necesito","busco","favor","porfa","porfavor","hola","buenas","buenos","dias","tardes","no"
+]);
+
+function stripPunct(s="") {
+  return String(s).replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+function simplifySearchQuery(raw="") {
+  const x = norm(stripPunct(raw));
+  if (!x) return "";
+  const tokens = x.split(" ").filter(Boolean).filter(t => !STOPWORDS_ES.has(t));
+
+  const keep = [];
+  for (const t of tokens) {
+    if (t === "11" || t === "12" || t === "13" || t === "14" || t === "15") keep.push(t);
+    else if (t.length >= 3) keep.push(t);
+  }
+
+  const model = detectIphoneModel(x);
+  const wantsDisplay = includesAny(x, ["display","pantalla","modulo","tactil","táctil"]);
+
+  if (model && wantsDisplay) return `display ${model}`;
+  if (model) return model;
+
+  return keep.join(" ").trim();
 }
 
 /* =========================
@@ -421,7 +448,7 @@ async function sendWhatsAppText(to, text) {
 /* =========================
    Sessions + Dedup
 ========================= */
-const sessions = new Map(); // from -> { inputItems: [], lastCategory: string|null }
+const sessions = new Map();
 const seenMsg = new Map();
 const SEEN_TTL = 10 * 60 * 1000;
 
@@ -446,7 +473,7 @@ function resetSession(from) {
 }
 
 /* =========================
-   ✅ Prompt (asesor) - Mejorado
+   Prompt (asesor) - Mejorado
 ========================= */
 const BK_PROMPT = `
 Eres BK GLOBAL IA, asesor comercial y técnico de BK GLOBAL (Colombia).
@@ -553,7 +580,6 @@ async function tool_list_products_by_category(args, sess) {
   if (!category_name) return { ok: false, error: "category_name vacío" };
   sess.lastCategory = category_name;
 
-  // ✅ Traer más para rankear mejor, luego recortar
   const fetchLimit = Math.min(Math.max(limit * 5, 20), 60);
 
   const products = await odooSearchProductsByCategory({
@@ -585,7 +611,6 @@ async function tool_list_products_by_category(args, sess) {
   if (availability === "in_stock") filtered = items.filter((x) => x.in_stock);
   if (availability === "out_of_stock") filtered = items.filter((x) => !x.in_stock);
 
-  // ✅ Orden: score desc, luego in_stock primero
   filtered.sort((a, b) => {
     const sa = Number(a._score || 0);
     const sb = Number(b._score || 0);
@@ -594,7 +619,6 @@ async function tool_list_products_by_category(args, sess) {
     return 0;
   });
 
-  // ✅ Si availability === "any" mantener stock primero PERO sin perder score
   if (availability === "any") {
     const inS = filtered.filter((x) => x.in_stock);
     const outS = filtered.filter((x) => !x.in_stock);
@@ -611,28 +635,63 @@ async function tool_list_products_by_category(args, sess) {
 }
 
 async function tool_search_products(args, sess) {
-  const query = String(args?.query || "").trim();
+  const rawQuery = String(args?.query || "").trim();
   const limit = Number(args?.limit || OPTIONS_LIMIT);
-  if (!query) return { ok: false, error: "query vacío" };
+  if (!rawQuery) return { ok: false, error: "query vacío" };
 
-  // ✅ Traer más para rankear; antes traías solo "limit" y por id desc podía caer vidrio/visor
-  const fetchLimit = Math.min(Math.max(limit * 6, 30), 60);
+  const q1 = simplifySearchQuery(rawQuery);
 
-  const products = await odooSearchProducts({ q: query, limit: fetchLimit });
-  if (!products.length) return { ok: true, count: 0, items: [] };
+  const qNorm = norm(stripPunct(rawQuery));
+  const model = detectIphoneModel(qNorm);
+  const wantsDisplay = includesAny(qNorm, ["display","pantalla","modulo","tactil","táctil"]);
+  const wantsGlass = includesAny(qNorm, ["vidrio","visor","cristal","glass","protector","lente"]);
 
-  const ids = products.map((p) => p.id);
+  const queries = [];
+  if (q1) queries.push(q1);
+  if (model && wantsDisplay) queries.push(`display ${model}`);
+  if (model && !wantsDisplay) queries.push(model);
+  if (wantsDisplay && !model) queries.push("display");
+
+  const uniqQueries = [...new Set(queries.filter(Boolean))].slice(0, 3);
+
+  const fetchLimit = Math.min(Math.max(limit * 8, 40), 80);
+  const merged = new Map();
+
+  for (const q of uniqQueries) {
+    const products = await odooSearchProducts({ q, limit: fetchLimit });
+    for (const p of products || []) merged.set(p.id, p);
+  }
+
+  const productsAll = Array.from(merged.values());
+  if (!productsAll.length) return { ok: true, count: 0, items: [] };
+
+  const ids = productsAll.map((p) => p.id);
   const availMap = await odooGetAvailabilityMap(ids);
 
-  const items = products.map((p) => {
+  const items = productsAll.map((p) => {
     const available = (availMap.get(p.id) || 0) > 0;
     const priceOk = shouldShowPrice(p.list_price);
     const product_tmpl_id = Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id;
 
-    const score = scoreProductForQuery(
+    let score = scoreProductForQuery(
       { name: p.display_name, code: p.default_code },
-      query
+      rawQuery
     );
+
+    const n = norm(p.display_name || "");
+    if (wantsDisplay) {
+      if (includesAny(n, ["display", "pantalla"])) score += 50;
+      if (includesAny(n, ["tactil", "táctil"])) score += 15;
+
+      const isGlass = includesAny(n, ["vidrio","visor","cristal","glass","protector","lente"]);
+      if (isGlass && !wantsGlass) score -= 120;
+    }
+
+    if (model === "iphone 11") {
+      if (includesAny(n, ["pro max", "promax"])) score -= 120;
+      else if (includesAny(n, [" pro"])) score -= 80;
+      else score += 20;
+    }
 
     return {
       id: p.id,
@@ -646,11 +705,9 @@ async function tool_search_products(args, sess) {
     };
   });
 
-  // Mantén lastCategory si hay alguna
   const bestCat = items.find((x) => x.category)?.category || null;
   if (bestCat) sess.lastCategory = bestCat;
 
-  // ✅ Orden por score primero, y dentro por stock
   items.sort((a, b) => {
     const sa = Number(a._score || 0);
     const sb = Number(b._score || 0);
@@ -659,7 +716,6 @@ async function tool_search_products(args, sess) {
     return 0;
   });
 
-  // ✅ Stock primero sin perder relevancia
   const sorted = [...items.filter((x) => x.in_stock), ...items.filter((x) => !x.in_stock)];
 
   const finalItems = pick(sorted, Math.min(Math.max(limit, 1), 60)).map((x) => {
@@ -690,13 +746,11 @@ async function tool_get_product_details(args, sess) {
   const limit = Number(args?.limit || 3);
   if (!query) return { ok: false, error: "query vacío" };
 
-  // ✅ Trae un poco más para que tome el correcto (igual solo muestra 3)
   const products = await odooSearchProducts({ q: query, limit: Math.min(Math.max(limit * 4, 6), 12) });
   if (!products.length) {
     return { ok: true, found: 0, items: [], note: "No se encontró el producto en Odoo con ese texto/código." };
   }
 
-  // ✅ Rank también aquí para que details muestre lo más relevante primero
   const ranked = products
     .map((p) => ({
       p,
